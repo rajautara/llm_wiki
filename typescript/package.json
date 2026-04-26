@@ -1,0 +1,31 @@
+{
+  "name": "llm-wiki-engine",
+  "version": "2.0.0",
+  "description": "File-based LLM wiki engine console app using an OpenAI-compatible chat API.",
+  "type": "module",
+  "bin": {
+    "llm-wiki": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "tsx src/index.ts",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "openai": "^4.104.0",
+    "pdf-parse": "^1.1.1",
+    "yaml": "^2.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pdf-parse": "^1.1.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -5,13 +5,13 @@
 | Layer | Path | Owner | Rule |
 |-------|------|-------|------|
 | Raw Sources | `raw/` | Human | Immutable. Agent reads only. Never edit. |
-| Wiki Pages | `wiki/` | LLM + app validator | Agent proposes; the selected app validates and writes. |
+| Wiki Pages | `wiki/` | LLM + TypeScript validator | Agent proposes; TypeScript validates and writes. |
 | Schema | `schema.md` | Human | Rules for page format, writing, linting, and safety. |
 
 The engine must follow this flow:
 
 ```text
-LLM suggests -> app validates -> app writes safely
+LLM suggests -> TypeScript validates -> TypeScript writes safely
 ```
 
 The LLM is never trusted as a filesystem operator.

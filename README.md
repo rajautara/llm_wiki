@@ -1,14 +1,22 @@
 # LLM Wiki Engine
 
-LLM Wiki Engine is a lightweight, file-based personal knowledge wiki builder powered by an OpenAI-compatible chat API. It ingests source files, asks an LLM to propose structured wiki pages, validates the result in Python, and writes safe Markdown files under `wiki/`.
+LLM Wiki Engine is a lightweight, file-based personal knowledge wiki builder powered by an OpenAI-compatible chat API. This repository contains separate Python and TypeScript console app implementations.
 
 The core design principle is:
 
 ```text
-LLM suggests -> Python validates -> Python writes safely
+LLM suggests -> app validates -> app writes safely
 ```
 
-The LLM is used for extraction, summarization, linking, page selection, and optional quality auditing. Python remains responsible for filesystem safety, validation, backups, indexing, and command execution.
+The LLM is used for extraction, summarization, linking, page selection, and optional quality auditing. The selected implementation remains responsible for filesystem safety, validation, backups, indexing, and command execution.
+
+## Project Variants
+
+- **Python project**: `python/`
+- **TypeScript project**: `typescript/`
+- **Shared schema reference**: `schema.md`
+
+Each project folder also contains its own `schema.md` and `.env.example` so it can be run independently from that folder.
 
 ## Features
 
@@ -25,31 +33,25 @@ The LLM is used for extraction, summarization, linking, page selection, and opti
 
 ## Project Structure
 
-Initial repository files:
+Repository layout:
 
 ```text
 llm_wiki/
 ├── README.md
 ├── schema.md
-└── wiki.py
-```
-
-After running initialization:
-
-```text
-llm_wiki/
-├── raw/
-│   └── source-files.pdf
-├── wiki/
-│   ├── index.md
-│   ├── entities/
-│   ├── concepts/
-│   ├── sources/
-│   ├── archive/
-│   └── .backups/
-├── README.md
-├── schema.md
-└── wiki.py
+├── python/
+│   ├── README.md
+│   ├── requirements.txt
+│   ├── schema.md
+│   ├── tests/
+│   └── wiki.py
+└── typescript/
+    ├── README.md
+    ├── package.json
+    ├── schema.md
+    ├── src/
+    │   └── index.ts
+    └── tsconfig.json
 ```
 
 ### Directory Responsibilities
@@ -62,26 +64,35 @@ llm_wiki/
 - **`wiki/archive/`**: Archived pages. Pages should be archived rather than permanently deleted.
 - **`wiki/.backups/`**: Automatic backups made before overwriting existing pages.
 - **`wiki/index.md`**: Auto-generated index. Do not edit manually.
-- **`schema.md`**: Human-owned schema defining page format, style, validation, and safety rules.
-- **`wiki.py`**: Main CLI application.
+- **`schema.md`**: Shared reference schema defining page format, style, validation, and safety rules.
+- **`python/`**: Python CLI project.
+- **`typescript/`**: Node.js TypeScript CLI project.
 
 ## Requirements
 
-- Python 3.9 or newer is recommended.
+- Python 3.9 or newer for `python/`.
+- Node.js 20 or newer for `typescript/`.
 - An OpenAI-compatible API key is required for commands that call the LLM.
 
-Recommended Python packages:
+Install dependencies from the implementation folder you want to use:
 
 ```bash
-pip install openai pyyaml httpx pymupdf
+cd python
+pip install -r requirements.txt
+```
+
+```bash
+cd typescript
+npm install
 ```
 
 ### Dependency Notes
 
 - **`openai`**: Required for LLM-backed commands such as `ingest`, `query`, and `lint --deep`.
-- **`pyyaml`**: Required for YAML frontmatter parsing and writing.
-- **`httpx`**: Required when SSL verification is disabled with `WIKI_VERIFY_SSL=false`.
-- **`pymupdf`**: Required only for PDF ingestion.
+- **`yaml`**: Required for YAML frontmatter parsing and writing.
+- **`pdf-parse`**: Required for PDF ingestion.
+- **`commander`**: Required for the console command interface.
+- **`dotenv`**: Required for loading local `.env` files.
 
 ## Environment Variables
 
@@ -141,70 +152,42 @@ The application loads `.env` automatically. Real `.env` files are ignored by Git
 
 ## Quick Start
 
-1. Install dependencies:
+Choose an implementation and run commands from that folder.
 
-   ```bash
-   pip install openai pyyaml httpx pymupdf
-   ```
+### Python
 
-2. Create your local environment file:
+```bash
+cd python
+pip install -r requirements.txt
+python wiki.py init
+python wiki.py ingest raw/my-paper.pdf --dry-run
+```
 
-   ```bash
-   cp .env.example .env
-   ```
+### TypeScript
 
-   On Windows PowerShell:
+```bash
+cd typescript
+npm install
+npm start -- init
+npm start -- ingest raw/my-paper.pdf --dry-run
+```
 
-   ```powershell
-   Copy-Item .env.example .env
-   ```
+Create your local environment file inside the selected project folder:
 
-   Edit `.env` and set `OPENAI_API_KEY`.
+```powershell
+Copy-Item .env.example .env
+```
 
-3. Initialize the wiki structure:
-
-   ```bash
-   python wiki.py init
-   ```
-
-4. Add source files to `raw/`:
-
-   ```text
-   raw/my-paper.pdf
-   raw/notes.md
-   raw/report.txt
-   ```
-
-5. Test ingestion without writing files:
-
-   ```bash
-   python wiki.py ingest raw/my-paper.pdf --dry-run
-   ```
-
-6. Ingest the source:
-
-   ```bash
-   python wiki.py ingest raw/my-paper.pdf
-   ```
-
-7. Query the wiki:
-
-   ```bash
-   python wiki.py query "What are the main concepts in this source?"
-   ```
-
-8. Audit wiki quality:
-
-   ```bash
-   python wiki.py lint
-   ```
+Edit `.env` and set `OPENAI_API_KEY`.
 
 ## CLI Reference
 
-Run the CLI with:
+The examples below use the TypeScript project command format. For Python command examples, see `python/README.md`.
+
+Run the TypeScript CLI from `typescript/` with:
 
 ```bash
-python wiki.py <command> [options]
+npm start -- <command> [options]
 ```
 
 ### `init`
@@ -212,7 +195,7 @@ python wiki.py <command> [options]
 Create the recommended directory structure and generate `wiki/index.md`.
 
 ```bash
-python wiki.py init
+npm start -- init
 ```
 
 Options:
@@ -224,7 +207,7 @@ Options:
 Example:
 
 ```bash
-python wiki.py init --force-schema
+npm start -- init --force-schema
 ```
 
 Use `--force-schema` carefully because it replaces your current schema file.
@@ -234,7 +217,7 @@ Use `--force-schema` carefully because it replaces your current schema file.
 Ingest a source file and create or update wiki pages.
 
 ```bash
-python wiki.py ingest raw/your_file.pdf
+npm start -- ingest raw/your_file.pdf
 ```
 
 Options:
@@ -248,14 +231,14 @@ Options:
 Examples:
 
 ```bash
-python wiki.py ingest raw/paper.pdf --dry-run
-python wiki.py ingest raw/paper.pdf --model gpt-4o-mini
-python wiki.py ingest C:/Users/you/Desktop/source.txt --allow-outside-raw
+npm start -- ingest raw/paper.pdf --dry-run
+npm start -- ingest raw/paper.pdf --model gpt-4o-mini
+npm start -- ingest C:/Users/you/Desktop/source.txt --allow-outside-raw
 ```
 
 #### Supported Source Types
 
-PDF files are read with PyMuPDF:
+PDF files are read with `pdf-parse`:
 
 ```text
 .pdf
@@ -290,7 +273,7 @@ During ingestion, the engine:
 Ask a question using only existing wiki content.
 
 ```bash
-python wiki.py query "What is self-attention?"
+npm start -- query "What is self-attention?"
 ```
 
 Options:
@@ -303,8 +286,8 @@ Options:
 Examples:
 
 ```bash
-python wiki.py query "Which entities are related to transformers?"
-python wiki.py query "Summarize the core trade-offs" --no-llm-select
+npm start -- query "Which entities are related to transformers?"
+npm start -- query "Summarize the core trade-offs" --no-llm-select
 ```
 
 Query answers must:
@@ -319,7 +302,7 @@ Query answers must:
 Audit the wiki for structural and quality issues.
 
 ```bash
-python wiki.py lint
+npm start -- lint
 ```
 
 Options:
@@ -333,9 +316,9 @@ Options:
 Examples:
 
 ```bash
-python wiki.py lint
-python wiki.py lint --json
-python wiki.py lint --deep
+npm start -- lint
+npm start -- lint --json
+npm start -- lint --deep
 ```
 
 The lint command reports:
@@ -357,7 +340,7 @@ The lint command reports:
 Regenerate the wiki index.
 
 ```bash
-python wiki.py rebuild-index
+npm start -- rebuild-index
 ```
 
 This writes `wiki/index.md` based on current wiki pages and groups them by page type.
@@ -367,7 +350,7 @@ This writes `wiki/index.md` based on current wiki pages and groups them by page 
 Archive a page instead of deleting it.
 
 ```bash
-python wiki.py archive "Page-Title" --reason "Merged into [[New-Page]]"
+npm start -- archive "Page-Title" --reason "Merged into [[New-Page]]"
 ```
 
 Behavior:
@@ -472,7 +455,7 @@ The application intentionally limits what the LLM can do.
 - Links between pages.
 - Updates to existing pages.
 
-### Python Enforces
+### TypeScript Enforces
 
 - Paths must remain inside `wiki/`.
 - Paths must be relative.
@@ -500,7 +483,7 @@ This makes ingestion safer when updating existing knowledge.
 Pages should not be permanently deleted. Use `archive` instead:
 
 ```bash
-python wiki.py archive "Old-Page" --reason "Merged into [[Better-Page]]"
+npm start -- archive "Old-Page" --reason "Merged into [[Better-Page]]"
 ```
 
 ## Typical Workflow
@@ -508,38 +491,38 @@ python wiki.py archive "Old-Page" --reason "Merged into [[Better-Page]]"
 ### Build a New Wiki
 
 ```bash
-python wiki.py init
+npm start -- init
 ```
 
 Place files into `raw/`, then run:
 
 ```bash
-python wiki.py ingest raw/source.pdf --dry-run
-python wiki.py ingest raw/source.pdf
-python wiki.py lint
+npm start -- ingest raw/source.pdf --dry-run
+npm start -- ingest raw/source.pdf
+npm start -- lint
 ```
 
 ### Add a New Source
 
 ```bash
-python wiki.py ingest raw/new-source.md --dry-run
-python wiki.py ingest raw/new-source.md
-python wiki.py rebuild-index
-python wiki.py lint
+npm start -- ingest raw/new-source.md --dry-run
+npm start -- ingest raw/new-source.md
+npm start -- rebuild-index
+npm start -- lint
 ```
 
 ### Ask Questions
 
 ```bash
-python wiki.py query "What are the main entities in the wiki?"
-python wiki.py query "Which concepts are connected to retrieval augmented generation?"
+npm start -- query "What are the main entities in the wiki?"
+npm start -- query "Which concepts are connected to retrieval augmented generation?"
 ```
 
 ### Maintain Quality
 
 ```bash
-python wiki.py lint
-python wiki.py lint --deep
+npm start -- lint
+npm start -- lint --deep
 ```
 
 Use lint results to fix missing links, weak pages, stale pages, duplicate titles, or missing required sections.
@@ -562,20 +545,12 @@ The provider must support OpenAI-compatible chat completions. JSON-mode support 
 
 The command needs an API key. Set `OPENAI_API_KEY` in `.env` before running `ingest`, `query`, or `lint --deep`.
 
-### `YAML frontmatter requires PyYAML`
+### Missing Node dependencies
 
-Install PyYAML:
-
-```bash
-pip install pyyaml
-```
-
-### `PDF ingestion requires: pip install pymupdf`
-
-Install PyMuPDF:
+Install dependencies:
 
 ```bash
-pip install pymupdf
+npm install
 ```
 
 ### `Source must be inside raw/`
@@ -583,7 +558,7 @@ pip install pymupdf
 Move the file into `raw/` or intentionally allow an outside source:
 
 ```bash
-python wiki.py ingest path/to/source.txt --allow-outside-raw
+npm start -- ingest path/to/source.txt --allow-outside-raw
 ```
 
 ### `Model did not return valid JSON`
@@ -597,7 +572,7 @@ The selected model did not follow the required JSON output format. Try:
 
 ### `Ingest aborted. Model output failed validation`
 
-The model returned pages that failed Python validation. Common causes include:
+The model returned pages that failed TypeScript validation. Common causes include:
 
 - Missing required frontmatter fields.
 - Invalid page type.
@@ -637,7 +612,7 @@ Use this only when you understand the security implications.
 - Very large sources are truncated to `100,000` characters before ingestion.
 - Query answers are only as complete as the current wiki content.
 - `query --no-llm-select` uses keyword overlap, which is less semantic than LLM page selection.
-- PDF extraction quality depends on the PDF structure and PyMuPDF output.
+- PDF extraction quality depends on the PDF structure and `pdf-parse` output.
 - The tool does not maintain a database; the wiki is file-based Markdown.
 
 ## License
