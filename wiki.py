@@ -10,6 +10,11 @@ Environment:
     OPENAI_BASE_URL      Optional, default: https://api.openai.com/v1
     WIKI_MODEL           Optional, default: gpt-4o
     WIKI_VERIFY_SSL      Optional, default: true. Set false/0/off/no to disable.
+    WIKI_RAW_DIR         Optional, default: raw
+    WIKI_OUTPUT_DIR      Optional, default: wiki
+    WIKI_SCHEMA_FILE     Optional, default: schema.md
+
+Configuration is loaded automatically from .env when present.
 
 Recommended dependencies:
     pip install openai pyyaml httpx pymupdf
@@ -39,6 +44,38 @@ from openai import OpenAI
 # CONFIG
 # ============================================================
 
+def load_env_file(path: Path = Path(".env")) -> None:
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
+
+
+load_env_file()
+
 DEFAULT_MODEL = os.getenv("WIKI_MODEL", "gpt-4o")
 API_KEY = os.getenv("OPENAI_API_KEY")
 BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -48,16 +85,15 @@ VERIFY_SSL = os.getenv("WIKI_VERIFY_SSL", "true").lower() not in {
     "off",
     "no",
 }
+RAW_DIR = Path(os.getenv("WIKI_RAW_DIR", "raw"))
+WIKI_DIR = Path(os.getenv("WIKI_OUTPUT_DIR", "wiki"))
+BACKUP_DIR = WIKI_DIR / os.getenv("WIKI_BACKUP_DIR_NAME", ".backups")
+SCHEMA_FILE = Path(os.getenv("WIKI_SCHEMA_FILE", "schema.md"))
 
-RAW_DIR = Path("raw")
-WIKI_DIR = Path("wiki")
-BACKUP_DIR = WIKI_DIR / ".backups"
-SCHEMA_FILE = Path("schema.md")
-
-DATE_FMT = "%Y-%m-%d"
-MAX_SOURCE_CHARS = 100_000
-MAX_EXISTING_FULL_PAGES = 8
-MAX_EXISTING_FULL_CHARS_PER_PAGE = 12_000
+DATE_FMT = os.getenv("WIKI_DATE_FORMAT", "%Y-%m-%d")
+MAX_SOURCE_CHARS = env_int("WIKI_MAX_SOURCE_CHARS", 100_000)
+MAX_EXISTING_FULL_PAGES = env_int("WIKI_MAX_EXISTING_FULL_PAGES", 8)
+MAX_EXISTING_FULL_CHARS_PER_PAGE = env_int("WIKI_MAX_EXISTING_FULL_CHARS_PER_PAGE", 12_000)
 
 VALID_PAGE_TYPES = {"entity", "concept", "source", "index", "note"}
 REQUIRED_FRONTMATTER = {"type", "sources", "created", "updated", "tags"}
