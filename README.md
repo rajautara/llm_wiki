@@ -113,14 +113,19 @@ Then edit `.env` and replace placeholder values such as `OPENAI_API_KEY`.
 | `WIKI_MAX_SOURCE_CHARS` | No | `100000` | Maximum source text characters sent during ingestion. |
 | `WIKI_MAX_EXISTING_FULL_PAGES` | No | `8` | Maximum existing full pages included as ingestion context. |
 | `WIKI_MAX_EXISTING_FULL_CHARS_PER_PAGE` | No | `12000` | Maximum characters included per existing full page. |
+| `WIKI_MAX_EXISTING_SUMMARIES` | No | `200` | Maximum number of existing-page summaries sent during ingestion. |
+| `WIKI_USE_JSON_RESPONSE_FORMAT` | No | `true` | Set to `false` for providers that do not support OpenAI's JSON response format. |
+| `WIKI_CHAT_MAX_RETRIES` | No | `2` | Retries on transient chat errors (`0` disables retries). |
 
 ### `.env` Example
 
 ```env
-OPENAI_API_KEY=your_api_key_here
+OPENAI_API_KEY=
 OPENAI_BASE_URL=https://api.openai.com/v1
 WIKI_MODEL=gpt-4o
 WIKI_VERIFY_SSL=true
+WIKI_USE_JSON_RESPONSE_FORMAT=true
+WIKI_CHAT_MAX_RETRIES=2
 WIKI_RAW_DIR=raw
 WIKI_OUTPUT_DIR=wiki
 WIKI_BACKUP_DIR_NAME=.backups
@@ -129,6 +134,7 @@ WIKI_DATE_FORMAT=%Y-%m-%d
 WIKI_MAX_SOURCE_CHARS=100000
 WIKI_MAX_EXISTING_FULL_PAGES=8
 WIKI_MAX_EXISTING_FULL_CHARS_PER_PAGE=12000
+WIKI_MAX_EXISTING_SUMMARIES=200
 ```
 
 The application loads `.env` automatically. Real `.env` files are ignored by Git, while `.env.example` is kept as the safe template.
@@ -366,11 +372,13 @@ python wiki.py archive "Page-Title" --reason "Merged into [[New-Page]]"
 
 Behavior:
 
-- Finds the page by exact title.
-- Adds archive metadata to frontmatter.
-- Moves the page to `wiki/archive/`.
+- Finds the live page by exact title (archived pages are skipped).
+- Refuses to archive pages that are missing or have invalid frontmatter.
+- Adds archive metadata to frontmatter (`archived: true`, `reason`, updated date).
+- Moves the page under `wiki/archive/`, preserving its original subdirectory.
+- Appends a UTC timestamp to the archived filename if a collision exists.
 - Backs up the original page first.
-- Regenerates `wiki/index.md`.
+- Regenerates `wiki/index.md` with archived pages listed under a separate `## Archived` section.
 
 ## Wiki Page Format
 
@@ -401,7 +409,8 @@ Allowed page types:
 - **`concept`**: Idea, method, algorithm, theory, pattern, or reusable abstraction.
 - **`source`**: Source-level page for an imported document.
 - **`note`**: General note when the page does not fit another type.
-- **`index`**: Auto-generated index page.
+
+The `wiki/index.md` file is auto-generated and is not assigned a `type`. The LLM is not allowed to write it directly.
 
 ## Required Page Sections
 

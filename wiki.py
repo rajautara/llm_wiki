@@ -6,13 +6,16 @@ Design principle:
     LLM suggests -> Python validates -> Python writes safely
 
 Environment:
-    OPENAI_API_KEY       Required for ingest/query/deep lint
-    OPENAI_BASE_URL      Optional, default: https://api.openai.com/v1
-    WIKI_MODEL           Optional, default: gpt-4o
-    WIKI_VERIFY_SSL      Optional, default: true. Set false/0/off/no to disable.
-    WIKI_RAW_DIR         Optional, default: raw
-    WIKI_OUTPUT_DIR      Optional, default: wiki
-    WIKI_SCHEMA_FILE     Optional, default: schema.md
+    OPENAI_API_KEY                    Required for ingest/query/deep lint
+    OPENAI_BASE_URL                   Optional, default: https://api.openai.com/v1
+    WIKI_MODEL                        Optional, default: gpt-4o
+    WIKI_VERIFY_SSL                   Optional, default: true. Set false/0/off/no to disable.
+    WIKI_RAW_DIR                      Optional, default: raw
+    WIKI_OUTPUT_DIR                   Optional, default: wiki
+    WIKI_SCHEMA_FILE                  Optional, default: schema.md
+    WIKI_USE_JSON_RESPONSE_FORMAT     Optional, default: true. Disable for non-OpenAI providers.
+    WIKI_CHAT_MAX_RETRIES             Optional, default: 2. Retries on transient chat errors.
+    WIKI_MAX_EXISTING_SUMMARIES       Optional, default: 200. Caps page summaries sent during ingest.
 
 Configuration is loaded automatically from .env when present.
 
@@ -94,8 +97,16 @@ DATE_FMT = os.getenv("WIKI_DATE_FORMAT", "%Y-%m-%d")
 MAX_SOURCE_CHARS = env_int("WIKI_MAX_SOURCE_CHARS", 100_000)
 MAX_EXISTING_FULL_PAGES = env_int("WIKI_MAX_EXISTING_FULL_PAGES", 8)
 MAX_EXISTING_FULL_CHARS_PER_PAGE = env_int("WIKI_MAX_EXISTING_FULL_CHARS_PER_PAGE", 12_000)
+MAX_EXISTING_SUMMARIES = env_int("WIKI_MAX_EXISTING_SUMMARIES", 200)
+CHAT_MAX_RETRIES = env_int("WIKI_CHAT_MAX_RETRIES", 2)
+USE_JSON_RESPONSE_FORMAT = os.getenv("WIKI_USE_JSON_RESPONSE_FORMAT", "true").lower() not in {
+    "false",
+    "0",
+    "off",
+    "no",
+}
 
-VALID_PAGE_TYPES = {"entity", "concept", "source", "index", "note"}
+VALID_PAGE_TYPES = {"entity", "concept", "source", "note"}
 REQUIRED_FRONTMATTER = {"type", "sources", "created", "updated", "tags"}
 
 ENTITY_REQUIRED_SECTIONS = [
@@ -668,6 +679,22 @@ def get_existing_pages() -> List[WikiPage]:
     return pages
 
 
+def is_archived_page(page: WikiPage) -> bool:
+    if page.frontmatter.get("archived"):
+        return True
+
+    archive_root = (wiki_root_resolved() / "archive").resolve()
+
+    try:
+        return page.path.resolve().is_relative_to(archive_root)
+    except (ValueError, OSError):
+        return False
+
+
+def get_live_pages() -> List[WikiPage]:
+    return [p for p in get_existing_pages() if not is_archived_page(p)]
+
+
 def page_summaries_for_prompt(pages: Sequence[WikiPage]) -> List[Dict[str, Any]]:
     summaries = []
 
@@ -711,7 +738,21 @@ def rank_pages_by_overlap(
 
 
 def existing_context_for_ingest(source_text: str, pages: Sequence[WikiPage]) -> str:
-    summaries = page_summaries_for_prompt(pages)
+    ranked_for_summaries = rank_pages_by_overlap(
+        source_text,
+        pages,
+        MAX_EXISTING_SUMMARIES,
+    )
+
+    if len(ranked_for_summaries) < min(len(pages), MAX_EXISTING_SUMMARIES):
+        seen = {p.path for p in ranked_for_summaries}
+        for p in pages:
+            if len(ranked_for_summaries) >= MAX_EXISTING_SUMMARIES:
+                break
+            if p.path not in seen:
+                ranked_for_summaries.append(p)
+
+    summaries = page_summaries_for_prompt(ranked_for_summaries)
 
     ranked = rank_pages_by_overlap(
         source_text,
@@ -736,7 +777,9 @@ def existing_context_for_ingest(source_text: str, pages: Sequence[WikiPage]) -> 
 
     return json.dumps(
         {
-            "all_page_summaries": summaries,
+            "page_summaries": summaries,
+            "page_summaries_truncated": len(pages) > len(summaries),
+            "total_existing_pages": len(pages),
             "full_relevant_existing_pages": full_pages,
         },
         ensure_ascii=False,
@@ -892,11 +935,13 @@ def backup_page(path: Path) -> Optional[Path]:
 
 def regenerate_index() -> None:
     WIKI_DIR.mkdir(parents=True, exist_ok=True)
-    pages = get_existing_pages()
+    all_pages = get_existing_pages()
+    live_pages = [p for p in all_pages if not is_archived_page(p)]
+    archived_pages = [p for p in all_pages if is_archived_page(p)]
 
     groups: Dict[str, List[WikiPage]] = defaultdict(list)
 
-    for p in pages:
+    for p in live_pages:
         groups[p.page_type].append(p)
 
     preferred_order = ["source", "entity", "concept", "note"]
@@ -932,12 +977,51 @@ def regenerate_index() -> None:
 
         lines.append("")
 
-    write_text_file(WIKI_DIR / "index.md", "\n".join(lines).rstrip() + "\n")
+    if archived_pages:
+        lines.append("## Archived")
+        lines.append("")
+
+        for p in sorted(archived_pages, key=lambda item: item.title.lower()):
+            rel = p.path.resolve().relative_to(wiki_root_resolved())
+            reason = p.frontmatter.get("reason")
+            suffix = f" — {reason}" if reason else ""
+            lines.append(f"- [[{p.title}]] — `{rel}`{suffix}")
+
+        lines.append("")
+
+    new_content = "\n".join(lines).rstrip() + "\n"
+    index_path = WIKI_DIR / "index.md"
+
+    if index_path.exists() and read_text_file(index_path) == new_content:
+        return
+
+    write_text_file(index_path, new_content)
 
 
 # ============================================================
 # OPENAI HELPERS
 # ============================================================
+
+def _chat_create_with_retries(client: OpenAI, **kwargs: Any) -> Any:
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(CHAT_MAX_RETRIES + 1):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+
+            if attempt == CHAT_MAX_RETRIES:
+                break
+
+            print(
+                f"[!] Chat call failed (attempt {attempt + 1}/{CHAT_MAX_RETRIES + 1}): {exc}",
+                file=sys.stderr,
+            )
+
+    assert last_exc is not None
+    raise last_exc
+
 
 def chat_json(
     client: OpenAI,
@@ -946,16 +1030,19 @@ def chat_json(
     user: str,
     temperature: float = 0.2,
 ) -> Dict[str, Any]:
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        response_format={"type": "json_object"},
-        temperature=temperature,
-    )
+        "temperature": temperature,
+    }
 
+    if USE_JSON_RESPONSE_FORMAT:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    resp = _chat_create_with_retries(client, **kwargs)
     content = resp.choices[0].message.content or ""
 
     try:
@@ -971,7 +1058,8 @@ def chat_text(
     user: str,
     temperature: float = 0.3,
 ) -> str:
-    resp = client.chat.completions.create(
+    resp = _chat_create_with_retries(
+        client,
         model=model,
         messages=[
             {"role": "system", "content": system},
@@ -987,6 +1075,18 @@ def chat_text(
 # COMMAND: INIT
 # ============================================================
 
+def _bootstrap_schema_text() -> str:
+    bundled = Path(__file__).resolve().parent / "schema.md"
+
+    if bundled.exists() and bundled.resolve() != SCHEMA_FILE.resolve():
+        try:
+            return read_text_file(bundled)
+        except Exception:
+            pass
+
+    return DEFAULT_SCHEMA
+
+
 def cmd_init(force_schema: bool = False) -> None:
     RAW_DIR.mkdir(exist_ok=True)
     WIKI_DIR.mkdir(exist_ok=True)
@@ -998,7 +1098,7 @@ def cmd_init(force_schema: bool = False) -> None:
     BACKUP_DIR.mkdir(exist_ok=True)
 
     if force_schema or not SCHEMA_FILE.exists():
-        write_text_file(SCHEMA_FILE, DEFAULT_SCHEMA)
+        write_text_file(SCHEMA_FILE, _bootstrap_schema_text())
 
     regenerate_index()
 
@@ -1041,8 +1141,9 @@ def cmd_ingest(
         source_text = source_text[:MAX_SOURCE_CHARS] + "\n\n[Content truncated]"
 
     schema = read_text_file(SCHEMA_FILE) if SCHEMA_FILE.exists() else DEFAULT_SCHEMA
-    existing_pages = get_existing_pages()
+    existing_pages = get_live_pages()
     existing_context = existing_context_for_ingest(source_text, existing_pages)
+    wiki_dir_name = WIKI_DIR.name
 
     prompt = f"""You are a careful wiki compiler.
 
@@ -1074,7 +1175,7 @@ Return exactly this JSON object:
 {{
   "pages": [
     {{
-      "path": "wiki/concepts/Example-Concept.md",
+      "path": "{wiki_dir_name}/concepts/Example-Concept.md",
       "frontmatter": {{
         "type": "concept",
         "sources": ["{source_filename}"],
@@ -1089,10 +1190,10 @@ Return exactly this JSON object:
 }}
 
 Hard rules:
-- Path must be inside wiki/.
-- Never write wiki/index.md.
+- Path must be inside {wiki_dir_name}/.
+- Never write {wiki_dir_name}/index.md.
 - Filename stem must match H1 exactly.
-  Example: path "wiki/concepts/Self-Attention.md" must have content starting with "# Self-Attention".
+  Example: path "{wiki_dir_name}/concepts/Self-Attention.md" must have content starting with "# Self-Attention".
 - Use entity, concept, source, or note only.
 - Entity pages must include all entity sections from schema.
 - Concept pages must include all concept sections from schema.
@@ -1216,7 +1317,7 @@ def cmd_query(
     no_llm_select: bool = False,
 ) -> None:
     client = get_client()
-    pages = get_existing_pages()
+    pages = get_live_pages()
 
     if not pages:
         print("Wiki is empty. Run: python wiki.py ingest raw/your_file.pdf")
@@ -1277,6 +1378,8 @@ Instructions:
     )
 
     print(answer)
+    print("")
+    print(f"[Pages used: {', '.join(p.title for p in relevant_pages)}]")
 
 
 # ============================================================
@@ -1288,13 +1391,13 @@ def parse_date(value: Any) -> Optional[datetime]:
         return None
 
     if isinstance(value, datetime):
-        return value
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
     text = str(value).strip()
 
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"):
         try:
-            return datetime.strptime(text, fmt)
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             pass
 
@@ -1302,22 +1405,30 @@ def parse_date(value: Any) -> Optional[datetime]:
 
 
 def find_duplicate_like_titles(titles: Sequence[str]) -> List[Tuple[str, str]]:
-    normalized: Dict[str, str] = {}
-    duplicates: List[Tuple[str, str]] = []
+    groups: Dict[str, List[str]] = defaultdict(list)
 
     for title in titles:
         key = re.sub(r"[^a-z0-9]+", "", title.lower())
+        groups[key].append(title)
 
-        if key in normalized and normalized[key] != title:
-            duplicates.append((normalized[key], title))
-        else:
-            normalized[key] = title
+    duplicates: List[Tuple[str, str]] = []
+
+    for members in groups.values():
+        unique_members = sorted(set(members))
+
+        if len(unique_members) < 2:
+            continue
+
+        for i in range(len(unique_members)):
+            for j in range(i + 1, len(unique_members)):
+                duplicates.append((unique_members[i], unique_members[j]))
 
     return duplicates
 
 
 def lint_pages() -> Dict[str, Any]:
-    pages = get_existing_pages()
+    all_pages = get_existing_pages()
+    pages = [p for p in all_pages if not is_archived_page(p)]
     all_titles = {p.title for p in pages}
 
     incoming: Dict[str, List[str]] = defaultdict(list)
@@ -1399,7 +1510,7 @@ def lint_pages() -> Dict[str, Any]:
         updated = parse_date(fm.get("updated"))
 
         if updated:
-            age_days = (datetime.now() - updated).days
+            age_days = (datetime.now(timezone.utc) - updated).days
 
             if age_days >= 90:
                 issues["stale_pages"].append(
@@ -1526,21 +1637,45 @@ Return JSON only:
 
 def cmd_archive(title: str, reason: str) -> None:
     pages = get_existing_pages()
-    matches = [p for p in pages if p.title == title]
+    matches = [p for p in pages if p.title == title and not is_archived_page(p)]
 
     if not matches:
-        print(f"No page found with title: {title}")
+        print(f"No live page found with title: {title}")
+        return
+
+    if len(matches) > 1:
+        print(f"Multiple live pages share title {title!r}; refusing to archive ambiguously:")
+        for p in matches:
+            print(f"  - {p.path}")
         return
 
     page = matches[0]
     text = read_text_file(page.path)
     fm, body = strip_frontmatter(text)
 
+    if not fm:
+        print(f"Refusing to archive {page.path}: missing YAML frontmatter.")
+        return
+
+    try:
+        fm = validate_frontmatter(fm)
+    except Exception as exc:
+        print(f"Refusing to archive {page.path}: invalid frontmatter: {exc}")
+        return
+
     fm["archived"] = True
     fm["reason"] = reason
     fm["updated"] = today_str()
 
-    archived_path = WIKI_DIR / "archive" / page.path.name
+    archive_root = WIKI_DIR / "archive"
+    rel = page.path.resolve().relative_to(wiki_root_resolved())
+    archived_path = archive_root / rel
+
+    if archived_path.exists():
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        archived_path = archived_path.with_name(
+            f"{archived_path.stem}.{timestamp}{archived_path.suffix}"
+        )
 
     backup_page(page.path)
     write_text_file(archived_path, dump_frontmatter(fm, body))
