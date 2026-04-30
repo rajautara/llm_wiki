@@ -14,9 +14,9 @@ The LLM is used for extraction, summarization, linking, page selection, and opti
 
 - **Python project**: `python/`
 - **TypeScript project**: `typescript/`
-- **Shared schema reference**: `schema.md`
+- **Shared schema reference**: `llmwiki_skill.md`
 
-Each project folder also contains its own `schema.md` and `.env.example` so it can be run independently from that folder.
+Each project folder also contains its own `llmwiki_skill.md` and `.env.example` so it can be run independently from that folder.
 
 ## Features
 
@@ -38,17 +38,20 @@ Repository layout:
 ```text
 llm_wiki/
 ├── README.md
-├── schema.md
+├── llmwiki_skill.md
+├── .env.example
 ├── python/
 │   ├── README.md
 │   ├── requirements.txt
-│   ├── schema.md
+│   ├── llmwiki_skill.md
+│   ├── .env.example
 │   ├── tests/
 │   └── wiki.py
 └── typescript/
     ├── README.md
     ├── package.json
-    ├── schema.md
+    ├── llmwiki_skill.md
+    ├── .env.example
     ├── src/
     │   └── index.ts
     └── tsconfig.json
@@ -64,7 +67,7 @@ llm_wiki/
 - **`wiki/archive/`**: Archived pages. Pages should be archived rather than permanently deleted.
 - **`wiki/.backups/`**: Automatic backups made before overwriting existing pages.
 - **`wiki/index.md`**: Auto-generated index. Do not edit manually.
-- **`schema.md`**: Shared reference schema defining page format, style, validation, and safety rules.
+- **`llmwiki_skill.md`**: Shared reference schema defining page format, style, validation, and safety rules.
 - **`python/`**: Python CLI project.
 - **`typescript/`**: Node.js TypeScript CLI project.
 
@@ -119,12 +122,13 @@ Then edit `.env` and replace placeholder values such as `OPENAI_API_KEY`.
 | `WIKI_RAW_DIR` | No | `raw` | Directory containing source files to ingest. |
 | `WIKI_OUTPUT_DIR` | No | `wiki` | Directory where generated wiki pages are written. |
 | `WIKI_BACKUP_DIR_NAME` | No | `.backups` | Backup directory name inside `WIKI_OUTPUT_DIR`. |
-| `WIKI_SCHEMA_FILE` | No | `schema.md` | Schema file used to guide and validate generated pages. |
+| `WIKI_SCHEMA_FILE` | No | `llmwiki_skill.md` | Schema file used to guide and validate generated pages. |
 | `WIKI_DATE_FORMAT` | No | `%Y-%m-%d` | Date format used for frontmatter dates. |
-| `WIKI_MAX_SOURCE_CHARS` | No | `100000` | Maximum source text characters sent during ingestion. |
-| `WIKI_MAX_EXISTING_FULL_PAGES` | No | `8` | Maximum existing full pages included as ingestion context. |
-| `WIKI_MAX_EXISTING_FULL_CHARS_PER_PAGE` | No | `12000` | Maximum characters included per existing full page. |
 | `WIKI_MAX_EXISTING_SUMMARIES` | No | `200` | Maximum number of existing-page summaries sent during ingestion. |
+| `WIKI_MAX_FULL_PAGES` | No | `8` | Caps how many existing pages are embedded in full content in the ingest prompt. |
+| `WIKI_INGEST_PRESELECT` | No | `true` | Use a cheap LLM call (summaries only) to pick which existing pages to embed in full. Falls back to keyword overlap if disabled or if the call fails. |
+| `WIKI_INGEST_STREAM` | No | `true` | Stream the ingest model response so progress is visible while it generates. |
+| `WIKI_INGEST_SKIP_CONNECTION_TEST` | No | `true` | Skip the pre-flight connection ping during ingest (the main call surfaces errors). |
 | `WIKI_USE_JSON_RESPONSE_FORMAT` | No | `true` | Set to `false` for providers that do not support OpenAI's JSON response format. |
 | `WIKI_CHAT_MAX_RETRIES` | No | `2` | Retries on transient chat errors (`0` disables retries). |
 
@@ -140,12 +144,13 @@ WIKI_CHAT_MAX_RETRIES=2
 WIKI_RAW_DIR=raw
 WIKI_OUTPUT_DIR=wiki
 WIKI_BACKUP_DIR_NAME=.backups
-WIKI_SCHEMA_FILE=schema.md
+WIKI_SCHEMA_FILE=llmwiki_skill.md
 WIKI_DATE_FORMAT=%Y-%m-%d
-WIKI_MAX_SOURCE_CHARS=100000
-WIKI_MAX_EXISTING_FULL_PAGES=8
-WIKI_MAX_EXISTING_FULL_CHARS_PER_PAGE=12000
 WIKI_MAX_EXISTING_SUMMARIES=200
+WIKI_MAX_FULL_PAGES=8
+WIKI_INGEST_PRESELECT=true
+WIKI_INGEST_STREAM=true
+WIKI_INGEST_SKIP_CONNECTION_TEST=true
 ```
 
 The application loads `.env` automatically. Real `.env` files are ignored by Git, while `.env.example` is kept as the safe template.
@@ -259,14 +264,21 @@ During ingestion, the engine:
 1. Verifies the source file exists and is readable.
 2. Requires the file to be inside `raw/` unless `--allow-outside-raw` is used.
 3. Extracts source text.
-4. Truncates very large sources to `100,000` characters.
-5. Loads existing wiki context.
+4. Loads existing wiki context (summaries plus a capped set of full pages).
+5. Optionally runs a cheap LLM preselect call to pick which existing pages to embed in full (controlled by `WIKI_INGEST_PRESELECT` and capped by `WIKI_MAX_FULL_PAGES`).
 6. Sends the schema, existing context, and source content to the model.
-7. Requires the model to return JSON with proposed pages.
-8. Validates every proposed page.
-9. Backs up existing pages before overwriting.
-10. Writes Markdown files under `wiki/`.
-11. Regenerates `wiki/index.md`.
+7. Streams the response when `WIKI_INGEST_STREAM=true` so live progress (chars / elapsed seconds) is visible.
+8. Requires the model to return JSON with proposed pages.
+9. Validates every proposed page.
+10. Backs up existing pages before overwriting.
+11. Writes Markdown files under `wiki/`.
+12. Regenerates `wiki/index.md`.
+
+#### Ingest Performance Notes
+
+- The pre-flight connection ping is skipped by default during ingest (`WIKI_INGEST_SKIP_CONNECTION_TEST=true`); transport errors surface from the main call instead.
+- For wikis with more than `WIKI_MAX_FULL_PAGES` (default `8`) live pages, a cheap summaries-only preselect call picks the most relevant pages to embed in full. This keeps the prompt size bounded as the wiki grows.
+- If the preselect call fails or returns no titles, the engine falls back to local keyword-overlap ranking with the same cap.
 
 ### `query`
 
@@ -599,7 +611,7 @@ Use this only when you understand the security implications.
 - Run `--dry-run` before ingesting important sources.
 - Run `lint` after each ingestion batch.
 - Review generated pages for factual correctness.
-- Keep `schema.md` strict and explicit.
+- Keep `llmwiki_skill.md` strict and explicit.
 - Prefer archiving pages instead of deleting them.
 - Use exact `[[Page-Title]]` links.
 - Keep pages compact, verifiable, and source-backed.
@@ -609,12 +621,13 @@ Use this only when you understand the security implications.
 ## Limitations
 
 - The engine depends on the selected model following instructions and returning valid JSON.
-- Very large sources are truncated to `100,000` characters before ingestion.
+- Source text is sent to the model in full; very large sources may exceed model context windows.
 - Query answers are only as complete as the current wiki content.
 - `query --no-llm-select` uses keyword overlap, which is less semantic than LLM page selection.
-- PDF extraction quality depends on the PDF structure and `pdf-parse` output.
+- PDF extraction quality depends on the PDF structure and `pdf-parse` output (TypeScript) or `pymupdf` (Python).
 - The tool does not maintain a database; the wiki is file-based Markdown.
 
 ## License
 
 No license file is currently included. Add a license before distributing or publishing this project.
+                                                                                                                                                                                                                        

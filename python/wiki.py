@@ -12,10 +12,14 @@ Environment:
     WIKI_VERIFY_SSL                   Optional, default: true. Set false/0/off/no to disable.
     WIKI_RAW_DIR                      Optional, default: raw
     WIKI_OUTPUT_DIR                   Optional, default: wiki
-    WIKI_SCHEMA_FILE                  Optional, default: schema.md
+    WIKI_SCHEMA_FILE                  Optional, default: llmwiki_skill.md
     WIKI_USE_JSON_RESPONSE_FORMAT     Optional, default: true. Disable for non-OpenAI providers.
     WIKI_CHAT_MAX_RETRIES             Optional, default: 2. Retries on transient chat errors.
     WIKI_MAX_EXISTING_SUMMARIES       Optional, default: 200. Caps page summaries sent during ingest.
+    WIKI_MAX_FULL_PAGES               Optional, default: 8. Caps full-content existing pages embedded in the ingest prompt.
+    WIKI_INGEST_PRESELECT             Optional, default: true. Use a cheap LLM call to pick which existing pages to embed in full.
+    WIKI_INGEST_STREAM                Optional, default: true. Stream the ingest model response for live progress.
+    WIKI_INGEST_SKIP_CONNECTION_TEST  Optional, default: true. Skip the pre-flight connection ping during ingest.
 
 Configuration is loaded automatically from .env when present.
 
@@ -34,6 +38,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -77,6 +82,15 @@ def env_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer.") from exc
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() not in {"false", "0", "off", "no", ""}
+
+
 load_env_file()
 
 DEFAULT_MODEL = os.getenv("WIKI_MODEL", "gpt-4o")
@@ -91,13 +105,16 @@ VERIFY_SSL = os.getenv("WIKI_VERIFY_SSL", "true").lower() not in {
 RAW_DIR = Path(os.getenv("WIKI_RAW_DIR", "raw"))
 WIKI_DIR = Path(os.getenv("WIKI_OUTPUT_DIR", "wiki"))
 BACKUP_DIR = WIKI_DIR / os.getenv("WIKI_BACKUP_DIR_NAME", ".backups")
-SCHEMA_FILE = Path(os.getenv("WIKI_SCHEMA_FILE", "schema.md"))
+SCHEMA_FILE = Path(os.getenv("WIKI_SCHEMA_FILE", "llmwiki_skill.md"))
+OVERVIEW_FILE = WIKI_DIR / "overview.md"
+LOG_FILE = WIKI_DIR / "log.md"
 
 DATE_FMT = os.getenv("WIKI_DATE_FORMAT", "%Y-%m-%d")
-MAX_SOURCE_CHARS = env_int("WIKI_MAX_SOURCE_CHARS", 100_000)
-MAX_EXISTING_FULL_PAGES = env_int("WIKI_MAX_EXISTING_FULL_PAGES", 8)
-MAX_EXISTING_FULL_CHARS_PER_PAGE = env_int("WIKI_MAX_EXISTING_FULL_CHARS_PER_PAGE", 12_000)
 MAX_EXISTING_SUMMARIES = env_int("WIKI_MAX_EXISTING_SUMMARIES", 200)
+MAX_FULL_PAGES = env_int("WIKI_MAX_FULL_PAGES", 8)
+INGEST_PRESELECT = env_bool("WIKI_INGEST_PRESELECT", True)
+INGEST_STREAM = env_bool("WIKI_INGEST_STREAM", True)
+INGEST_SKIP_CONNECTION_TEST = env_bool("WIKI_INGEST_SKIP_CONNECTION_TEST", True)
 CHAT_MAX_RETRIES = env_int("WIKI_CHAT_MAX_RETRIES", 2)
 USE_JSON_RESPONSE_FORMAT = os.getenv("WIKI_USE_JSON_RESPONSE_FORMAT", "true").lower() not in {
     "false",
@@ -141,7 +158,7 @@ DEFAULT_SCHEMA = """# LLM Wiki Schema v2.0
 |-------|------|-------|------|
 | Raw Sources | `raw/` | Human | Immutable. Agent reads only. Never edit. |
 | Wiki Pages | `wiki/` | LLM + Python validator | Agent proposes; Python validates and writes. |
-| Schema | `schema.md` | Human | Rules for page format, writing, linting, and safety. |
+| Skill File | `llmwiki_skill.md` | Human | Rules for page format, writing, linting, and safety. |
 
 The engine must follow this flow:
 
@@ -160,15 +177,15 @@ Every wiki page lives under `wiki/`.
 Filenames:
 - Must end with `.md`.
 - Must not contain path traversal such as `../`.
-- Must use the page title as the filename stem.
-- Recommended format: `Title-Case-With-Hyphens.md`.
+- Determines the indexed page title from the filename.
+- Recommended format: `title-case-with-hyphens.md`.
 
 Examples:
 - `Self-Attention.md`
 - `Ashish-Vaswani.md`
 - `Transformer-Architecture.md`
 
-The page title is the filename without `.md`.
+The indexed page title is the filename without `.md`, with separators normalized for display.
 
 Use that exact title in all wiki links:
 
@@ -471,7 +488,8 @@ def write_text_file(path: Path, text: str) -> None:
 
 
 def normalize_title_from_filename(path: Path) -> str:
-    return path.stem
+    words = re.sub(r"[-_]+", " ", path.stem).split()
+    return " ".join(word.capitalize() for word in words)
 
 
 def extract_wiki_links(text: str) -> List[str]:
@@ -575,6 +593,9 @@ def sanitize_wiki_path(path_str: str) -> Path:
 
     if final_path == (wiki_root_resolved() / "index.md").resolve():
         raise ValueError("LLM is not allowed to write wiki/index.md directly.")
+
+    if final_path == LOG_FILE.resolve():
+        raise ValueError("LLM is not allowed to write wiki/log.md directly.")
 
     if any(part.startswith(".") for part in final_path.relative_to(wiki_root_resolved()).parts):
         raise ValueError(f"Hidden wiki paths are not allowed: {path_str}")
@@ -737,7 +758,12 @@ def rank_pages_by_overlap(
     return [p for score, p in scored[:limit] if score > 0]
 
 
-def existing_context_for_ingest(source_text: str, pages: Sequence[WikiPage]) -> str:
+def existing_context_for_ingest(
+    source_text: str,
+    pages: Sequence[WikiPage],
+    full_pages_override: Optional[Sequence[WikiPage]] = None,
+    max_full_pages: Optional[int] = None,
+) -> str:
     ranked_for_summaries = rank_pages_by_overlap(
         source_text,
         pages,
@@ -754,24 +780,22 @@ def existing_context_for_ingest(source_text: str, pages: Sequence[WikiPage]) -> 
 
     summaries = page_summaries_for_prompt(ranked_for_summaries)
 
-    ranked = rank_pages_by_overlap(
-        source_text,
-        pages,
-        MAX_EXISTING_FULL_PAGES,
-    )
+    cap = MAX_FULL_PAGES if max_full_pages is None else max_full_pages
+
+    if full_pages_override is not None:
+        selected = list(full_pages_override)[:cap]
+    else:
+        selected = rank_pages_by_overlap(source_text, pages, cap)
 
     full_pages = []
 
-    for p in ranked:
+    for p in selected:
         full_pages.append(
             {
                 "path": str(p.path),
                 "title": p.title,
                 "type": p.page_type,
-                "content": trim_text(
-                    read_text_file(p.path),
-                    MAX_EXISTING_FULL_CHARS_PER_PAGE,
-                ),
+                "content": read_text_file(p.path),
             }
         )
 
@@ -781,6 +805,7 @@ def existing_context_for_ingest(source_text: str, pages: Sequence[WikiPage]) -> 
             "page_summaries_truncated": len(pages) > len(summaries),
             "total_existing_pages": len(pages),
             "full_relevant_existing_pages": full_pages,
+            "full_relevant_existing_pages_capped_at": cap,
         },
         ensure_ascii=False,
         indent=2,
@@ -885,14 +910,6 @@ def validate_llm_page(
             f"{path}: content must begin with an H1 heading, e.g. '# Page Title'."
         )
 
-    expected_title = path.stem
-
-    if h1 != expected_title:
-        raise ValueError(
-            f"{path}: H1 title must match filename stem exactly. "
-            f"Expected '# {expected_title}', got '# {h1}'."
-        )
-
     missing_sections = validate_content_sections(content, str(fm["type"]))
 
     if missing_sections:
@@ -931,6 +948,130 @@ def backup_page(path: Path) -> Optional[Path]:
     shutil.copy2(path, backup_path)
 
     return backup_path
+
+
+def default_overview_content() -> str:
+    return dump_frontmatter(
+        {
+            "type": "note",
+            "sources": [],
+            "created": today_str(),
+            "updated": today_str(),
+            "tags": ["overview", "hub"],
+        },
+        "# Overview\n\n"
+        "This wiki compiles raw source documents into structured, cross-linked knowledge pages.\n\n"
+        "## Scope\n\n"
+        "- Source count: 0\n"
+        "- Page count: 0\n\n"
+        "## Key Findings\n\n"
+        "- Add key findings during ingest.\n\n"
+        "## Recent Updates\n\n"
+        "- No updates recorded yet.\n",
+    )
+
+
+def default_log_content() -> str:
+    return dump_frontmatter(
+        {
+            "type": "note",
+            "sources": [],
+            "created": today_str(),
+            "updated": today_str(),
+            "tags": ["log", "maintenance"],
+        },
+        "# Log\n\n"
+        "Append-only chronological record of ingests, major edits, queries, and lint passes.\n",
+    )
+
+
+def ensure_core_wiki_pages() -> None:
+    WIKI_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not OVERVIEW_FILE.exists():
+        write_text_file(OVERVIEW_FILE, default_overview_content())
+
+    if not LOG_FILE.exists():
+        write_text_file(LOG_FILE, default_log_content())
+
+
+def source_count() -> int:
+    if not RAW_DIR.exists():
+        return 0
+
+    return sum(1 for path in RAW_DIR.rglob("*") if path.is_file())
+
+
+def recent_log_entries(limit: int = 5) -> List[str]:
+    if not LOG_FILE.exists():
+        return []
+
+    entries = []
+
+    for line in read_text_file(LOG_FILE).splitlines():
+        if line.startswith("## ["):
+            entries.append(line[3:].strip())
+
+    return entries[-limit:]
+
+
+def append_ingest_log_entry(
+    source_filename: str,
+    validated_pages: Sequence[Tuple[Path, Dict[str, Any], str]],
+    summary: str,
+) -> None:
+    ensure_core_wiki_pages()
+    lines = [
+        "",
+        f"## [{today_str()}] ingest | {source_filename}",
+    ]
+
+    for path, _fm, _content in validated_pages:
+        rel = path.resolve().relative_to(wiki_root_resolved())
+        lines.append(f"- Changed page: [{normalize_title_from_filename(path)}]({rel.as_posix()})")
+
+    lines.append("- Updated overview with source and page counts")
+    lines.append(f"- Key takeaway: {summary}")
+
+    with LOG_FILE.open("a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines).rstrip() + "\n")
+
+
+def extract_key_findings_from_overview() -> List[str]:
+    if not OVERVIEW_FILE.exists():
+        return ["- Add key findings during ingest."]
+
+    text = read_text_file(OVERVIEW_FILE)
+    match = re.search(r"## Key Findings\s*\n(.*?)(?:\n## |\Z)", text, re.DOTALL)
+
+    if not match:
+        return ["- Add key findings during ingest."]
+
+    findings = [line.rstrip() for line in match.group(1).splitlines() if line.strip()]
+    return findings or ["- Add key findings during ingest."]
+
+
+def update_overview_page() -> None:
+    ensure_core_wiki_pages()
+    pages = [p for p in get_live_pages() if p.path.resolve() != OVERVIEW_FILE.resolve()]
+    findings = extract_key_findings_from_overview()
+    recent = recent_log_entries()
+    recent_lines = [f"- {entry}" for entry in recent] or ["- No updates recorded yet."]
+    content = (
+        "# Overview\n\n"
+        "This wiki compiles raw source documents into structured, cross-linked knowledge pages.\n\n"
+        "## Scope\n\n"
+        f"- Source count: {source_count()}\n"
+        f"- Page count: {len(pages)}\n\n"
+        "## Key Findings\n\n"
+        f"{chr(10).join(findings)}\n\n"
+        "## Recent Updates\n\n"
+        f"{chr(10).join(recent_lines)}\n"
+    )
+    fm, _body = strip_frontmatter(read_text_file(OVERVIEW_FILE))
+    fm = validate_frontmatter(fm or {"type": "note", "sources": [], "tags": []})
+    fm["updated"] = today_str()
+    write_text_file(OVERVIEW_FILE, dump_frontmatter(fm, content))
 
 
 def regenerate_index() -> None:
@@ -1007,7 +1148,14 @@ def _chat_create_with_retries(client: OpenAI, **kwargs: Any) -> Any:
 
     for attempt in range(CHAT_MAX_RETRIES + 1):
         try:
+            print(
+                f"  - Sending chat request (attempt {attempt + 1}/{CHAT_MAX_RETRIES + 1})...",
+                flush=True,
+            )
             return client.chat.completions.create(**kwargs)
+        except KeyboardInterrupt:
+            print("  - Chat request interrupted by user.", file=sys.stderr, flush=True)
+            raise
         except Exception as exc:
             last_exc = exc
 
@@ -1017,6 +1165,7 @@ def _chat_create_with_retries(client: OpenAI, **kwargs: Any) -> Any:
             print(
                 f"[!] Chat call failed (attempt {attempt + 1}/{CHAT_MAX_RETRIES + 1}): {exc}",
                 file=sys.stderr,
+                flush=True,
             )
 
     assert last_exc is not None
@@ -1051,6 +1200,108 @@ def chat_json(
         raise ValueError(f"Model did not return valid JSON:\n{content}") from exc
 
 
+def chat_json_streaming(
+    client: OpenAI,
+    model: str,
+    system: str,
+    user: str,
+    temperature: float = 0.2,
+) -> Dict[str, Any]:
+    """Like chat_json but streams the response and prints live progress to stderr."""
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": temperature,
+        "stream": True,
+    }
+
+    if USE_JSON_RESPONSE_FORMAT:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(CHAT_MAX_RETRIES + 1):
+        try:
+            print(
+                f"  - Streaming chat request (attempt {attempt + 1}/{CHAT_MAX_RETRIES + 1})...",
+                flush=True,
+            )
+
+            stream = client.chat.completions.create(**kwargs)
+            chunks: List[str] = []
+            started = time.monotonic()
+            last_print = started
+            total = 0
+
+            try:
+                for event in stream:
+                    try:
+                        delta = event.choices[0].delta
+                    except (AttributeError, IndexError):
+                        continue
+
+                    piece = getattr(delta, "content", None) or ""
+
+                    if not piece:
+                        continue
+
+                    chunks.append(piece)
+                    total += len(piece)
+                    now = time.monotonic()
+
+                    if now - last_print >= 1.0:
+                        elapsed = now - started
+                        sys.stderr.write(
+                            f"\r    streaming: {total:,} chars / {elapsed:5.1f}s"
+                        )
+                        sys.stderr.flush()
+                        last_print = now
+            finally:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
+            sys.stderr.write(
+                f"\r    streaming: {total:,} chars / {time.monotonic() - started:5.1f}s\n"
+            )
+            sys.stderr.flush()
+
+            content = "".join(chunks)
+
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Model did not return valid JSON:\n{content}"
+                ) from exc
+        except KeyboardInterrupt:
+            print("  - Chat request interrupted by user.", file=sys.stderr, flush=True)
+            raise
+        except ValueError:
+            # JSON parse failures are not retried; surface immediately.
+            raise
+        except Exception as exc:
+            last_exc = exc
+
+            if attempt == CHAT_MAX_RETRIES:
+                break
+
+            print(
+                f"[!] Streaming chat call failed (attempt {attempt + 1}/{CHAT_MAX_RETRIES + 1}): {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    assert last_exc is not None
+    raise last_exc
+
+
 def chat_text(
     client: OpenAI,
     model: str,
@@ -1071,12 +1322,38 @@ def chat_text(
     return resp.choices[0].message.content or ""
 
 
+def test_llm_connection(client: OpenAI, model: str) -> None:
+    print(f"  - Testing LLM connection with {model}...", flush=True)
+
+    try:
+        data = chat_json(
+            client=client,
+            model=model,
+            system="You are a connection test. Output only valid JSON.",
+            user='Return exactly this JSON: {"ok": true}',
+            temperature=0,
+        )
+    except Exception as exc:
+        print("\nLLM connection test failed.", file=sys.stderr, flush=True)
+        print(f"Base URL: {BASE_URL}", file=sys.stderr, flush=True)
+        print(f"Model: {model}", file=sys.stderr, flush=True)
+        print(f"Error: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
+
+    if data.get("ok") is not True:
+        print("\nLLM connection test failed.", file=sys.stderr, flush=True)
+        print(f"Expected JSON with ok=true, got: {data}", file=sys.stderr, flush=True)
+        raise SystemExit(1)
+
+    print("  - LLM connection OK.", flush=True)
+
+
 # ============================================================
 # COMMAND: INIT
 # ============================================================
 
 def _bootstrap_schema_text() -> str:
-    bundled = Path(__file__).resolve().parent / "schema.md"
+    bundled = Path(__file__).resolve().parent / "llmwiki_skill.md"
 
     if bundled.exists() and bundled.resolve() != SCHEMA_FILE.resolve():
         try:
@@ -1096,6 +1373,7 @@ def cmd_init(force_schema: bool = False) -> None:
     (WIKI_DIR / "sources").mkdir(exist_ok=True)
     (WIKI_DIR / "archive").mkdir(exist_ok=True)
     BACKUP_DIR.mkdir(exist_ok=True)
+    ensure_core_wiki_pages()
 
     if force_schema or not SCHEMA_FILE.exists():
         write_text_file(SCHEMA_FILE, _bootstrap_schema_text())
@@ -1118,31 +1396,146 @@ def cmd_init(force_schema: bool = False) -> None:
 # COMMAND: INGEST
 # ============================================================
 
+def select_relevant_pages_for_ingest(
+    client: OpenAI,
+    model: str,
+    source_text: str,
+    source_filename: str,
+    pages: Sequence[WikiPage],
+    max_titles: int,
+) -> List[WikiPage]:
+    """Cheap LLM call (summaries only) that picks which existing pages to embed in full.
+
+    Returns an empty list on failure, leaving callers free to fall back to overlap ranking.
+    """
+    if not pages or max_titles <= 0:
+        return []
+
+    summaries = page_summaries_for_prompt(pages)
+    # Cap source preview to keep this call cheap; selection only needs topical hints.
+    preview = source_text[:4000]
+
+    prompt = f"""Given a new source about to be ingested, select existing wiki page titles
+most likely to be relevant context for compiling new pages or updating existing ones.
+
+Source filename: {source_filename}
+
+Source text (truncated preview):
+{preview}
+
+Wiki page summaries:
+{json.dumps(summaries, ensure_ascii=False, indent=2)}
+
+Return JSON only:
+{{
+  "relevant_titles": ["Title-One", "Title-Two"]
+}}
+
+Rules:
+- Max {max_titles} titles.
+- Use exact titles only.
+- Prefer pages that overlap topically with the source.
+- If none are relevant, return an empty list.
+"""
+
+    try:
+        data = chat_json(
+            client=client,
+            model=model,
+            system="You select relevant wiki pages. Output only JSON.",
+            user=prompt,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        print(
+            f"  - Preselect call failed, falling back to overlap ranking: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return []
+
+    titles = data.get("relevant_titles", [])
+
+    if not isinstance(titles, list):
+        return []
+
+    by_title = {p.title: p for p in pages}
+    selected: List[WikiPage] = []
+
+    for t in titles:
+        if not isinstance(t, str):
+            continue
+        page = by_title.get(t)
+        if page is not None and page not in selected:
+            selected.append(page)
+        if len(selected) >= max_titles:
+            break
+
+    return selected
+
+
 def cmd_ingest(
     source_path: Path,
     model: str,
     allow_outside_raw: bool = False,
     dry_run: bool = False,
 ) -> None:
+    started_at = time.monotonic()
+    print(f"Starting ingest: {source_path}", flush=True)
+    print("  - Connecting to chat client...", flush=True)
     client = get_client()
+
+    if INGEST_SKIP_CONNECTION_TEST:
+        print("  - Skipping pre-flight connection test (errors will surface on the main call).", flush=True)
+    else:
+        test_llm_connection(client, model)
+
+    print("  - Validating source path...", flush=True)
     source_path = ensure_source_readable(
         source_path,
         allow_outside_raw=allow_outside_raw,
     )
 
     source_filename = source_path.name
+    print(f"  - Reading source: {source_filename}", flush=True)
     source_text = extract_text(source_path)
+    print(f"  - Source text size: {len(source_text):,} characters", flush=True)
 
-    if len(source_text) > MAX_SOURCE_CHARS:
-        print(
-            f"[!] Source truncated: {len(source_text)} -> {MAX_SOURCE_CHARS} chars",
-            file=sys.stderr,
-        )
-        source_text = source_text[:MAX_SOURCE_CHARS] + "\n\n[Content truncated]"
-
+    print("  - Preparing wiki context...", flush=True)
+    ensure_core_wiki_pages()
     schema = read_text_file(SCHEMA_FILE) if SCHEMA_FILE.exists() else DEFAULT_SCHEMA
     existing_pages = get_live_pages()
-    existing_context = existing_context_for_ingest(source_text, existing_pages)
+
+    full_pages_override: Optional[List[WikiPage]] = None
+
+    if INGEST_PRESELECT and len(existing_pages) > MAX_FULL_PAGES:
+        print(
+            f"  - Preselecting up to {MAX_FULL_PAGES} relevant pages from {len(existing_pages)} existing...",
+            flush=True,
+        )
+        full_pages_override = select_relevant_pages_for_ingest(
+            client=client,
+            model=model,
+            source_text=source_text,
+            source_filename=source_filename,
+            pages=existing_pages,
+            max_titles=MAX_FULL_PAGES,
+        )
+
+        if full_pages_override:
+            print(
+                f"  - Preselected {len(full_pages_override)} page(s): "
+                + ", ".join(p.title for p in full_pages_override),
+                flush=True,
+            )
+        else:
+            print("  - Preselect returned no titles; using overlap ranking.", flush=True)
+
+    existing_context = existing_context_for_ingest(
+        source_text,
+        existing_pages,
+        full_pages_override=full_pages_override,
+    )
     wiki_dir_name = WIKI_DIR.name
 
     prompt = f"""You are a careful wiki compiler.
@@ -1150,6 +1543,7 @@ def cmd_ingest(
 Your job:
 - Read the source.
 - Create new pages or update existing pages.
+- Update {wiki_dir_name}/overview.md when new source-level findings change the wiki scope, key findings, or recent updates.
 - Return JSON only.
 - Do not invent facts.
 - Do not modify raw source content.
@@ -1192,8 +1586,9 @@ Return exactly this JSON object:
 Hard rules:
 - Path must be inside {wiki_dir_name}/.
 - Never write {wiki_dir_name}/index.md.
-- Filename stem must match H1 exactly.
-  Example: path "{wiki_dir_name}/concepts/Self-Attention.md" must have content starting with "# Self-Attention".
+- Never write {wiki_dir_name}/log.md; the engine appends log entries after ingest.
+- Indexed page title comes from the filename, not the H1.
+  Example: path "{wiki_dir_name}/concepts/machine-learning.md" is indexed as "Machine Learning" even if the H1 says something else.
 - Use entity, concept, source, or note only.
 - Entity pages must include all entity sections from schema.
 - Concept pages must include all concept sections from schema.
@@ -1201,20 +1596,36 @@ Hard rules:
 - For existing pages, return the full updated content, not a diff.
 - Preserve useful existing content when updating.
 - Append new source notes; do not erase old source notes.
+- Prefer concepts/ for abstract ideas, entities/ for concrete things, and sources/ for source-level summaries.
 - Flag contradictions inline using: > ⚠️ Contradiction: ...
 - Use [[Exact-Page-Title]] links.
 """
 
-    result = chat_json(
-        client=client,
-        model=model,
-        system="You are a precise wiki compiler. Output only valid JSON.",
-        user=prompt,
-        temperature=0.2,
-    )
+    print(f"  - Chat base URL: {BASE_URL}", flush=True)
+    print(f"  - Prompt size: {len(prompt):,} characters", flush=True)
+    print(f"  - Asking model to compile wiki updates with {model}...", flush=True)
+
+    chat_call = chat_json_streaming if INGEST_STREAM else chat_json
+
+    try:
+        result = chat_call(
+            client=client,
+            model=model,
+            system="You are a precise wiki compiler. Output only valid JSON.",
+            user=prompt,
+            temperature=0.2,
+        )
+    except KeyboardInterrupt:
+        print("\nIngest cancelled while waiting for model response.", file=sys.stderr, flush=True)
+        raise SystemExit(130) from None
+    except Exception as exc:
+        print(f"\nIngest failed during model call: {exc}", file=sys.stderr, flush=True)
+        raise
 
     validate_llm_result(result)
 
+    print("  - Model response received.", flush=True)
+    print("  - Validating model output...", flush=True)
     validated_pages: List[Tuple[Path, Dict[str, Any], str]] = []
     errors: List[str] = []
 
@@ -1238,6 +1649,7 @@ Hard rules:
         raise SystemExit(1)
 
     if dry_run:
+        print("  - Dry run requested; skipping writes.", flush=True)
         print("Dry run passed validation. Pages that would be written:")
 
         for path, fm, _content in validated_pages:
@@ -1246,6 +1658,7 @@ Hard rules:
         print(f"\nSummary: {result.get('summary', 'Done.')}")
         return
 
+    print(f"  - Writing {len(validated_pages)} wiki page(s)...", flush=True)
     for path, fm, content in validated_pages:
         backup = backup_page(path)
         full = dump_frontmatter(fm, content)
@@ -1257,8 +1670,18 @@ Hard rules:
         else:
             print(f"  ✓ {path}")
 
+    print("  - Appending ingest log...", flush=True)
+    append_ingest_log_entry(
+        source_filename=source_filename,
+        validated_pages=validated_pages,
+        summary=str(result.get("summary", "Done.")),
+    )
+    print("  - Updating overview...", flush=True)
+    update_overview_page()
+    print("  - Regenerating index...", flush=True)
     regenerate_index()
-    print(f"\nIngest complete: {result.get('summary', 'Done.')}")
+    elapsed = time.monotonic() - started_at
+    print(f"\nIngest complete in {elapsed:.1f}s: {result.get('summary', 'Done.')}")
 
 
 # ============================================================
@@ -1316,12 +1739,16 @@ def cmd_query(
     model: str,
     no_llm_select: bool = False,
 ) -> None:
+    print("Starting query.", flush=True)
+    print("  - Connecting to chat client...", flush=True)
     client = get_client()
     pages = get_live_pages()
 
     if not pages:
         print("Wiki is empty. Run: python wiki.py ingest raw/your_file.pdf")
         return
+
+    test_llm_connection(client, model)
 
     if no_llm_select:
         relevant_pages = rank_pages_by_overlap(question, pages, limit=5)
@@ -1444,7 +1871,6 @@ def lint_pages() -> Dict[str, Any]:
         "stale_pages": [],
         "duplicate_like_titles": [],
         "too_few_outgoing_links": [],
-        "h1_filename_mismatches": [],
     }
 
     for p in pages:
@@ -1462,13 +1888,6 @@ def lint_pages() -> Dict[str, Any]:
             validate_frontmatter(fm)
         except Exception as exc:
             issues["invalid_frontmatter"].append(f"{p.path}: {exc}")
-
-        h1 = first_h1(body)
-
-        if h1 and h1 != p.title:
-            issues["h1_filename_mismatches"].append(
-                f"{p.path}: H1 '{h1}' != filename stem '{p.title}'"
-            )
 
         page_type = str(fm.get("type", "note"))
         missing_sections = validate_content_sections(body, page_type)
@@ -1545,7 +1964,6 @@ def print_lint_report(report: Dict[str, Any]) -> None:
     sections = [
         ("Missing frontmatter", "missing_frontmatter"),
         ("Invalid frontmatter", "invalid_frontmatter"),
-        ("H1 / filename mismatches", "h1_filename_mismatches"),
         ("Missing required sections", "missing_required_sections"),
         ("Missing links", "missing_links"),
         ("Orphan pages", "orphan_pages"),
@@ -1698,7 +2116,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument(
         "--force-schema",
         action="store_true",
-        help="Overwrite schema.md with the default schema",
+        help="Overwrite llmwiki_skill.md with the default skill file",
     )
 
     p_ingest = sub.add_parser("ingest", help="Ingest a raw source")

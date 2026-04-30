@@ -6,7 +6,7 @@
 |-------|------|-------|------|
 | Raw Sources | `raw/` | Human | Immutable. Agent reads only. Never edit. |
 | Wiki Pages | `wiki/` | LLM + TypeScript validator | Agent proposes; TypeScript validates and writes. |
-| Schema | `schema.md` | Human | Rules for page format, writing, linting, and safety. |
+| Skill File | `llmwiki_skill.md` | Human | Rules for page format, writing, linting, and safety. |
 
 The engine must follow this flow:
 
@@ -34,7 +34,7 @@ llm-wiki/
 │   ├── archive/
 │   └── .backups/
 ├── package.json
-├── schema.md
+├── llmwiki_skill.md
 ├── src/
 │   └── index.ts
 └── tsconfig.json
@@ -45,7 +45,7 @@ Rules:
 - `wiki/` contains generated markdown.
 - `wiki/archive/` stores obsolete or merged pages.
 - `wiki/.backups/` stores automatic backups before overwrite.
-- `schema.md` is human-owned and should be edited deliberately.
+- `llmwiki_skill.md` is human-owned and should be edited deliberately.
 
 ---
 
@@ -56,15 +56,15 @@ Every wiki page lives under `wiki/`.
 Filenames:
 - Must end with `.md`.
 - Must not contain path traversal such as `../`.
-- Must use the page title as the filename stem.
-- Recommended format: `Title-Case-With-Hyphens.md`.
+- Determines the indexed page title from the filename.
+- Recommended format: `title-case-with-hyphens.md`.
 
 Examples:
 - `Self-Attention.md`
 - `Ashish-Vaswani.md`
 - `Transformer-Architecture.md`
 
-The page title is the filename without `.md`.
+The indexed page title is the filename without `.md`, with separators normalized for display.
 
 Use that exact title in all wiki links:
 
@@ -383,7 +383,7 @@ Before finishing ingest, verify:
 
 - [ ] Every page has valid YAML frontmatter.
 - [ ] Every page has `type`, `sources`, `created`, `updated`, and `tags`.
-- [ ] H1 matches filename stem exactly.
+- [ ] Indexed title comes from the filename, not the H1.
 - [ ] Required sections exist for the page type.
 - [ ] Source filename is included in `sources`.
 - [ ] Every new page has useful `## Source Notes`.

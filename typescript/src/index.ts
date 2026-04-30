@@ -40,12 +40,15 @@ const VERIFY_SSL = !["false", "0", "off", "no"].includes((process.env.WIKI_VERIF
 const RAW_DIR = process.env.WIKI_RAW_DIR ?? "raw";
 const WIKI_DIR = process.env.WIKI_OUTPUT_DIR ?? "wiki";
 const BACKUP_DIR = path.join(WIKI_DIR, process.env.WIKI_BACKUP_DIR_NAME ?? ".backups");
-const SCHEMA_FILE = process.env.WIKI_SCHEMA_FILE ?? "schema.md";
+const SCHEMA_FILE = process.env.WIKI_SCHEMA_FILE ?? "llmwiki_skill.md";
+const OVERVIEW_FILE = path.join(WIKI_DIR, "overview.md");
+const LOG_FILE = path.join(WIKI_DIR, "log.md");
 const DATE_FMT = process.env.WIKI_DATE_FORMAT ?? "%Y-%m-%d";
-const MAX_SOURCE_CHARS = envInt("WIKI_MAX_SOURCE_CHARS", 100_000);
-const MAX_EXISTING_FULL_PAGES = envInt("WIKI_MAX_EXISTING_FULL_PAGES", 8);
-const MAX_EXISTING_FULL_CHARS_PER_PAGE = envInt("WIKI_MAX_EXISTING_FULL_CHARS_PER_PAGE", 12_000);
 const MAX_EXISTING_SUMMARIES = envInt("WIKI_MAX_EXISTING_SUMMARIES", 200);
+const MAX_FULL_PAGES = envInt("WIKI_MAX_FULL_PAGES", 8);
+const INGEST_PRESELECT = envBool("WIKI_INGEST_PRESELECT", true);
+const INGEST_STREAM = envBool("WIKI_INGEST_STREAM", true);
+const INGEST_SKIP_CONNECTION_TEST = envBool("WIKI_INGEST_SKIP_CONNECTION_TEST", true);
 const CHAT_MAX_RETRIES = envInt("WIKI_CHAT_MAX_RETRIES", 2);
 const USE_JSON_RESPONSE_FORMAT = !["false", "0", "off", "no"].includes((process.env.WIKI_USE_JSON_RESPONSE_FORMAT ?? "true").toLowerCase());
 
@@ -57,7 +60,7 @@ const SOURCE_REQUIRED_SECTIONS = ["## Source Summary", "## Extracted Entities", 
 
 const DEFAULT_SCHEMA = `# LLM Wiki Schema v2.0
 
-See schema.md for the complete default schema.
+See llmwiki_skill.md for the complete default skill file.
 `;
 
 function envInt(name: string, defaultValue: number): number {
@@ -66,6 +69,12 @@ function envInt(name: string, defaultValue: number): number {
   const parsed = Number.parseInt(value, 10);
   if (Number.isNaN(parsed)) throw new Error(`${name} must be an integer.`);
   return parsed;
+}
+
+function envBool(name: string, defaultValue: boolean): boolean {
+  const value = process.env[name];
+  if (value === undefined) return defaultValue;
+  return !["false", "0", "off", "no", ""].includes(value.trim().toLowerCase());
 }
 
 function todayStr(): string {
@@ -84,7 +93,7 @@ function writeTextFile(filePath: string, text: string): void {
 }
 
 function normalizeTitleFromFilename(filePath: string): string {
-  return path.basename(filePath, path.extname(filePath));
+  return path.basename(filePath, path.extname(filePath)).split(/[-_]+/).filter(Boolean).map((word: string) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()).join(" ");
 }
 
 function extractWikiLinks(text: string): string[] {
@@ -139,6 +148,7 @@ function sanitizeWikiPath(pathStr: string): string {
   if (!pathInside(finalPath, wikiRootResolved())) throw new Error(`Unsafe wiki path rejected: ${pathStr}`);
   if (path.extname(finalPath).toLowerCase() !== ".md") throw new Error(`Wiki page must end with .md: ${pathStr}`);
   if (finalPath === path.resolve(wikiRootResolved(), "index.md")) throw new Error("LLM is not allowed to write wiki/index.md directly.");
+  if (finalPath === path.resolve(LOG_FILE)) throw new Error("LLM is not allowed to write wiki/log.md directly.");
   const relParts = path.relative(wikiRootResolved(), finalPath).split(path.sep);
   if (relParts.some((part) => part.startsWith("."))) throw new Error(`Hidden wiki paths are not allowed: ${pathStr}`);
   return finalPath;
@@ -177,6 +187,17 @@ function walkMarkdownFiles(dir: string): string[] {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) results.push(...walkMarkdownFiles(full));
     else if (entry.isFile() && entry.name.endsWith(".md")) results.push(full);
+  }
+  return results.sort();
+}
+
+function walkFiles(dir: string): string[] {
+  if (!fs.existsSync(dir)) return [];
+  const results: string[] = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) results.push(...walkFiles(full));
+    else if (entry.isFile()) results.push(full);
   }
   return results.sort();
 }
@@ -237,19 +258,21 @@ function countTerms(terms: string[]): Map<string, number> {
   return counts;
 }
 
-function existingContextForIngest(sourceText: string, pages: WikiPage[]): string {
+function existingContextForIngest(sourceText: string, pages: WikiPage[], fullPagesOverride?: WikiPage[], maxFullPages?: number): string {
   const rankedForSummaries = rankPagesByOverlap(sourceText, pages, MAX_EXISTING_SUMMARIES);
   const seen = new Set(rankedForSummaries.map((page) => page.path));
   for (const page of pages) {
     if (rankedForSummaries.length >= MAX_EXISTING_SUMMARIES) break;
     if (!seen.has(page.path)) rankedForSummaries.push(page);
   }
-  const ranked = rankPagesByOverlap(sourceText, pages, MAX_EXISTING_FULL_PAGES);
+  const cap = maxFullPages ?? MAX_FULL_PAGES;
+  const selected = fullPagesOverride ? fullPagesOverride.slice(0, cap) : rankPagesByOverlap(sourceText, pages, cap);
   return JSON.stringify({
     page_summaries: pageSummariesForPrompt(rankedForSummaries),
     page_summaries_truncated: pages.length > rankedForSummaries.length,
     total_existing_pages: pages.length,
-    full_relevant_existing_pages: ranked.map((page) => ({ path: page.path, title: page.title, type: pageType(page), content: trimText(readTextFile(page.path), MAX_EXISTING_FULL_CHARS_PER_PAGE) }))
+    full_relevant_existing_pages: selected.map((page) => ({ path: page.path, title: page.title, type: pageType(page), content: readTextFile(page.path) })),
+    full_relevant_existing_pages_capped_at: cap
   }, null, 2);
 }
 
@@ -290,8 +313,6 @@ function validateLlmPage(page: unknown, sourceFilename: string): ValidatedPage {
   if (!content) throw new Error(`${finalPath}: content is empty.`);
   const h1 = firstH1(content);
   if (!h1) throw new Error(`${finalPath}: content must begin with an H1 heading, e.g. '# Page Title'.`);
-  const expectedTitle = path.basename(finalPath, path.extname(finalPath));
-  if (h1 !== expectedTitle) throw new Error(`${finalPath}: H1 title must match filename stem exactly. Expected '# ${expectedTitle}', got '# ${h1}'.`);
   const missingSections = validateContentSections(content, String(frontmatter.type));
   if (missingSections.length > 0) throw new Error(`${finalPath}: missing required sections: ${JSON.stringify(missingSections)}`);
   return { path: finalPath, frontmatter, content };
@@ -313,6 +334,85 @@ function backupPage(filePath: string): string | null {
   fs.mkdirSync(path.dirname(backupPath), { recursive: true });
   fs.copyFileSync(filePath, backupPath);
   return backupPath;
+}
+
+function defaultOverviewContent(): string {
+  return dumpFrontmatter(
+    { type: "note", sources: [], created: todayStr(), updated: todayStr(), tags: ["overview", "hub"] },
+    "# Overview\n\nThis wiki compiles raw source documents into structured, cross-linked knowledge pages.\n\n## Scope\n\n- Source count: 0\n- Page count: 0\n\n## Key Findings\n\n- Add key findings during ingest.\n\n## Recent Updates\n\n- No updates recorded yet.\n"
+  );
+}
+
+function defaultLogContent(): string {
+  return dumpFrontmatter(
+    { type: "note", sources: [], created: todayStr(), updated: todayStr(), tags: ["log", "maintenance"] },
+    "# Log\n\nAppend-only chronological record of ingests, major edits, queries, and lint passes.\n"
+  );
+}
+
+function ensureCoreWikiPages(): void {
+  fs.mkdirSync(WIKI_DIR, { recursive: true });
+  if (!fs.existsSync(OVERVIEW_FILE)) writeTextFile(OVERVIEW_FILE, defaultOverviewContent());
+  if (!fs.existsSync(LOG_FILE)) writeTextFile(LOG_FILE, defaultLogContent());
+}
+
+function sourceCount(): number {
+  if (!fs.existsSync(RAW_DIR)) return 0;
+  return walkFiles(RAW_DIR).length;
+}
+
+function recentLogEntries(limit = 5): string[] {
+  if (!fs.existsSync(LOG_FILE)) return [];
+  const entries = readTextFile(LOG_FILE).split(/\r?\n/).filter((line) => line.startsWith("## [")).map((line) => line.slice(3).trim());
+  return entries.slice(-limit);
+}
+
+function appendIngestLogEntry(sourceFilename: string, validatedPages: ValidatedPage[], summary: string): void {
+  ensureCoreWikiPages();
+  const lines = ["", `## [${todayStr()}] ingest | ${sourceFilename}`];
+  for (const page of validatedPages) {
+    const rel = path.relative(wikiRootResolved(), path.resolve(page.path)).replaceAll(path.sep, "/");
+    lines.push(`- Changed page: [${normalizeTitleFromFilename(page.path)}](${rel})`);
+  }
+  lines.push("- Updated overview with source and page counts");
+  lines.push(`- Key takeaway: ${summary}`);
+  fs.appendFileSync(LOG_FILE, `${lines.join("\n").trimEnd()}\n`, "utf8");
+}
+
+function extractKeyFindingsFromOverview(): string[] {
+  if (!fs.existsSync(OVERVIEW_FILE)) return ["- Add key findings during ingest."];
+  const match = readTextFile(OVERVIEW_FILE).match(/## Key Findings\s*\r?\n([\s\S]*?)(?:\r?\n## |\s*$)/);
+  if (!match) return ["- Add key findings during ingest."];
+  const findings = match[1].split(/\r?\n/).map((line) => line.trimEnd()).filter(Boolean);
+  return findings.length > 0 ? findings : ["- Add key findings during ingest."];
+}
+
+function updateOverviewPage(): void {
+  ensureCoreWikiPages();
+  const pages = getLivePages().filter((page) => path.resolve(page.path) !== path.resolve(OVERVIEW_FILE));
+  const findings = extractKeyFindingsFromOverview();
+  const recent = recentLogEntries().map((entry) => `- ${entry}`);
+  const content = `# Overview
+
+This wiki compiles raw source documents into structured, cross-linked knowledge pages.
+
+## Scope
+
+- Source count: ${sourceCount()}
+- Page count: ${pages.length}
+
+## Key Findings
+
+${findings.join("\n")}
+
+## Recent Updates
+
+${(recent.length > 0 ? recent : ["- No updates recorded yet."]).join("\n")}
+`;
+  const [frontmatter] = stripFrontmatter(readTextFile(OVERVIEW_FILE));
+  const fm = validateFrontmatter(Object.keys(frontmatter).length > 0 ? frontmatter : { type: "note", sources: [], tags: [] });
+  fm.updated = todayStr();
+  writeTextFile(OVERVIEW_FILE, dumpFrontmatter(fm, content));
 }
 
 function regenerateIndex(): void {
@@ -360,6 +460,7 @@ async function chatCreateWithRetries(client: OpenAI, kwargs: OpenAI.Chat.Complet
   let lastError: unknown;
   for (let attempt = 0; attempt <= CHAT_MAX_RETRIES; attempt += 1) {
     try {
+      console.log(`  - Sending chat request (attempt ${attempt + 1}/${CHAT_MAX_RETRIES + 1})...`);
       return await client.chat.completions.create(kwargs);
     } catch (error) {
       lastError = error;
@@ -384,15 +485,95 @@ async function chatJson(client: OpenAI, model: string, system: string, user: str
   }
 }
 
+async function chatJsonStreaming(client: OpenAI, model: string, system: string, user: string, temperature = 0.2): Promise<Record<string, unknown>> {
+  const kwargs: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
+    model,
+    messages: [{ role: "system", content: system }, { role: "user", content: user }],
+    temperature,
+    stream: true
+  };
+  if (USE_JSON_RESPONSE_FORMAT) kwargs.response_format = { type: "json_object" };
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= CHAT_MAX_RETRIES; attempt += 1) {
+    try {
+      console.log(`  - Streaming chat request (attempt ${attempt + 1}/${CHAT_MAX_RETRIES + 1})...`);
+      const stream = await client.chat.completions.create(kwargs);
+      const chunks: string[] = [];
+      const started = Date.now();
+      let lastPrint = started;
+      let total = 0;
+      const isTty = Boolean(process.stderr.isTTY);
+      try {
+        for await (const event of stream) {
+          const piece = event.choices?.[0]?.delta?.content ?? "";
+          if (!piece) continue;
+          chunks.push(piece);
+          total += piece.length;
+          const now = Date.now();
+          if (now - lastPrint >= 1000) {
+            const elapsed = ((now - started) / 1000).toFixed(1);
+            const line = `    streaming: ${total.toLocaleString()} chars / ${elapsed}s`;
+            if (isTty) process.stderr.write(`\r${line}`);
+            else process.stderr.write(`${line}\n`);
+            lastPrint = now;
+          }
+        }
+      } finally {
+        const closer = (stream as unknown as { controller?: { abort?: () => void } }).controller;
+        if (closer && typeof closer.abort === "function") {
+          // Best-effort cleanup; ignore if already finished.
+          try { /* no-op */ } catch { /* ignore */ }
+        }
+      }
+      const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+      const finalLine = `    streaming: ${total.toLocaleString()} chars / ${elapsed}s`;
+      process.stderr.write(`${isTty ? "\r" : ""}${finalLine}\n`);
+      const content = chunks.join("");
+      try {
+        const data = JSON.parse(content);
+        if (!isRecord(data)) throw new Error("JSON root is not an object.");
+        return data;
+      } catch (error) {
+        // JSON parse failures are not retried; surface immediately.
+        throw new Error(`Model did not return valid JSON:\n${content}`, { cause: error });
+      }
+    } catch (error) {
+      // Re-throw JSON parse errors immediately; retry transport errors.
+      if (error instanceof Error && error.message.startsWith("Model did not return valid JSON")) throw error;
+      lastError = error;
+      if (attempt === CHAT_MAX_RETRIES) break;
+      console.error(`[!] Streaming chat call failed (attempt ${attempt + 1}/${CHAT_MAX_RETRIES + 1}): ${String(error)}`);
+    }
+  }
+  throw lastError;
+}
+
 async function chatText(client: OpenAI, model: string, system: string, user: string, temperature = 0.3): Promise<string> {
   const response = await chatCreateWithRetries(client, { model, messages: [{ role: "system", content: system }, { role: "user", content: user }], temperature });
   return response.choices[0]?.message?.content ?? "";
 }
 
+async function testLlmConnection(client: OpenAI, model: string): Promise<void> {
+  console.log(`  - Testing LLM connection with ${model}...`);
+  try {
+    const data = await chatJson(client, model, "You are a connection test. Output only valid JSON.", 'Return exactly this JSON: {"ok": true}', 0);
+    if (data.ok !== true) throw new Error(`Expected JSON with ok=true, got: ${JSON.stringify(data)}`);
+    console.log("  - LLM connection OK.");
+  } catch (error) {
+    console.error("\nLLM connection test failed.");
+    console.error(`Base URL: ${BASE_URL}`);
+    console.error(`Model: ${model}`);
+    console.error(`Error: ${errorMessage(error)}`);
+    process.exitCode = 1;
+    throw error;
+  }
+}
+
 function bootstrapSchemaText(): string {
-  const bundled = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "schema.md");
+  const bundled = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "llmwiki_skill.md");
   if (fs.existsSync(bundled) && path.resolve(bundled) !== path.resolve(SCHEMA_FILE)) return readTextFile(bundled);
-  if (fs.existsSync("schema.md")) return readTextFile("schema.md");
+  if (fs.existsSync("llmwiki_skill.md")) return readTextFile("llmwiki_skill.md");
   return DEFAULT_SCHEMA;
 }
 
@@ -401,6 +582,7 @@ function cmdInit(forceSchema = false): void {
   fs.mkdirSync(WIKI_DIR, { recursive: true });
   for (const dir of ["entities", "concepts", "sources", "archive"]) fs.mkdirSync(path.join(WIKI_DIR, dir), { recursive: true });
   fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  ensureCoreWikiPages();
   if (forceSchema || !fs.existsSync(SCHEMA_FILE)) writeTextFile(SCHEMA_FILE, bootstrapSchemaText());
   regenerateIndex();
   console.log("Initialized LLM Wiki Engine structure.");
@@ -415,23 +597,90 @@ function cmdInit(forceSchema = false): void {
   console.log("  npm start -- ingest raw/your_file.pdf");
 }
 
+async function selectRelevantPagesForIngest(client: OpenAI, model: string, sourceText: string, sourceFilename: string, pages: WikiPage[], maxTitles: number): Promise<WikiPage[]> {
+  if (pages.length === 0 || maxTitles <= 0) return [];
+  const preview = sourceText.slice(0, 4000);
+  const prompt = `Given a new source about to be ingested, select existing wiki page titles
+most likely to be relevant context for compiling new pages or updating existing ones.
+
+Source filename: ${sourceFilename}
+
+Source text (truncated preview):
+${preview}
+
+Wiki page summaries:
+${JSON.stringify(pageSummariesForPrompt(pages), null, 2)}
+
+Return JSON only:
+{
+  "relevant_titles": ["Title-One", "Title-Two"]
+}
+
+Rules:
+- Max ${maxTitles} titles.
+- Use exact titles only.
+- Prefer pages that overlap topically with the source.
+- If none are relevant, return an empty list.
+`;
+  let data: Record<string, unknown>;
+  try {
+    data = await chatJson(client, model, "You select relevant wiki pages. Output only JSON.", prompt, 0.1);
+  } catch (error) {
+    console.error(`  - Preselect call failed, falling back to overlap ranking: ${errorMessage(error)}`);
+    return [];
+  }
+  const titles = data.relevant_titles;
+  if (!Array.isArray(titles)) return [];
+  const byTitle = new Map(pages.map((page) => [page.title, page] as const));
+  const selected: WikiPage[] = [];
+  for (const t of titles) {
+    if (typeof t !== "string") continue;
+    const page = byTitle.get(t);
+    if (page && !selected.includes(page)) selected.push(page);
+    if (selected.length >= maxTitles) break;
+  }
+  return selected;
+}
+
 async function cmdIngest(sourcePath: string, model: string, allowOutsideRaw = false, dryRun = false): Promise<void> {
+  const startedAt = Date.now();
+  console.log(`Starting ingest: ${sourcePath}`);
+  console.log("  - Connecting to chat client...");
   const client = getClient();
+  if (INGEST_SKIP_CONNECTION_TEST) {
+    console.log("  - Skipping pre-flight connection test (errors will surface on the main call).");
+  } else {
+    await testLlmConnection(client, model);
+  }
+  console.log("  - Validating source path...");
   const resolvedSourcePath = ensureSourceReadable(sourcePath, allowOutsideRaw);
   const sourceFilename = path.basename(resolvedSourcePath);
-  let sourceText = await extractText(resolvedSourcePath);
-  if (sourceText.length > MAX_SOURCE_CHARS) {
-    console.error(`[!] Source truncated: ${sourceText.length} -> ${MAX_SOURCE_CHARS} chars`);
-    sourceText = `${sourceText.slice(0, MAX_SOURCE_CHARS)}\n\n[Content truncated]`;
-  }
+  console.log(`  - Reading source: ${sourceFilename}`);
+  const sourceText = await extractText(resolvedSourcePath);
+  console.log(`  - Source text size: ${sourceText.length.toLocaleString()} characters`);
+  console.log("  - Preparing wiki context...");
+  ensureCoreWikiPages();
   const schema = fs.existsSync(SCHEMA_FILE) ? readTextFile(SCHEMA_FILE) : DEFAULT_SCHEMA;
-  const existingContext = existingContextForIngest(sourceText, getLivePages());
+  const existingPages = getLivePages();
+  let fullPagesOverride: WikiPage[] | undefined;
+  if (INGEST_PRESELECT && existingPages.length > MAX_FULL_PAGES) {
+    console.log(`  - Preselecting up to ${MAX_FULL_PAGES} relevant pages from ${existingPages.length} existing...`);
+    fullPagesOverride = await selectRelevantPagesForIngest(client, model, sourceText, sourceFilename, existingPages, MAX_FULL_PAGES);
+    if (fullPagesOverride.length > 0) {
+      console.log(`  - Preselected ${fullPagesOverride.length} page(s): ${fullPagesOverride.map((p) => p.title).join(", ")}`);
+    } else {
+      console.log("  - Preselect returned no titles; using overlap ranking.");
+      fullPagesOverride = undefined;
+    }
+  }
+  const existingContext = existingContextForIngest(sourceText, existingPages, fullPagesOverride);
   const wikiDirName = path.basename(WIKI_DIR);
   const prompt = `You are a careful wiki compiler.
 
 Your job:
 - Read the source.
 - Create new pages or update existing pages.
+- Update ${wikiDirName}/overview.md when new source-level findings change the wiki scope, key findings, or recent updates.
 - Return JSON only.
 - Do not invent facts.
 - Do not modify raw source content.
@@ -474,8 +723,9 @@ Return exactly this JSON object:
 Hard rules:
 - Path must be inside ${wikiDirName}/.
 - Never write ${wikiDirName}/index.md.
-- Filename stem must match H1 exactly.
-  Example: path "${wikiDirName}/concepts/Self-Attention.md" must have content starting with "# Self-Attention".
+- Never write ${wikiDirName}/log.md; the engine appends log entries after ingest.
+- Indexed page title comes from the filename, not the H1.
+  Example: path "${wikiDirName}/concepts/machine-learning.md" is indexed as "Machine Learning" even if the H1 says something else.
 - Use entity, concept, source, or note only.
 - Entity pages must include all entity sections from schema.
 - Concept pages must include all concept sections from schema.
@@ -483,11 +733,25 @@ Hard rules:
 - For existing pages, return the full updated content, not a diff.
 - Preserve useful existing content when updating.
 - Append new source notes; do not erase old source notes.
+- Prefer concepts/ for abstract ideas, entities/ for concrete things, and sources/ for source-level summaries.
 - Flag contradictions inline using: > ⚠️ Contradiction: ...
 - Use [[Exact-Page-Title]] links.
 `;
-  const result = await chatJson(client, model, "You are a precise wiki compiler. Output only valid JSON.", prompt, 0.2);
+  console.log(`  - Chat base URL: ${BASE_URL}`);
+  console.log(`  - Prompt size: ${prompt.length.toLocaleString()} characters`);
+  console.log(`  - Asking model to compile wiki updates with ${model}...`);
+  let result: Record<string, unknown>;
+  try {
+    const chatCall = INGEST_STREAM ? chatJsonStreaming : chatJson;
+    result = await chatCall(client, model, "You are a precise wiki compiler. Output only valid JSON.", prompt, 0.2);
+  } catch (error) {
+    console.error(`\nIngest failed during model call: ${errorMessage(error)}`);
+    process.exitCode = 1;
+    return;
+  }
   validateLlmResult(result);
+  console.log("  - Model response received.");
+  console.log("  - Validating model output...");
   const validatedPages: ValidatedPage[] = [];
   const errors: string[] = [];
   result.pages.forEach((page, index) => {
@@ -504,18 +768,26 @@ Hard rules:
     return;
   }
   if (dryRun) {
+    console.log("  - Dry run requested; skipping writes.");
     console.log("Dry run passed validation. Pages that would be written:");
     for (const page of validatedPages) console.log(`  - ${page.path} (${String(page.frontmatter.type)})`);
     console.log(`\nSummary: ${result.summary ?? "Done."}`);
     return;
   }
+  console.log(`  - Writing ${validatedPages.length} wiki page(s)...`);
   for (const page of validatedPages) {
     const backup = backupPage(page.path);
     writeTextFile(page.path, dumpFrontmatter(page.frontmatter, page.content));
     console.log(backup ? `  ✓ ${page.path}  (backup: ${backup})` : `  ✓ ${page.path}`);
   }
+  console.log("  - Appending ingest log...");
+  appendIngestLogEntry(sourceFilename, validatedPages, String(result.summary ?? "Done."));
+  console.log("  - Updating overview...");
+  updateOverviewPage();
+  console.log("  - Regenerating index...");
   regenerateIndex();
-  console.log(`\nIngest complete: ${result.summary ?? "Done."}`);
+  const elapsedSeconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+  console.log(`\nIngest complete in ${elapsedSeconds}s: ${result.summary ?? "Done."}`);
 }
 
 async function selectRelevantPagesWithLlm(client: OpenAI, model: string, question: string, pages: WikiPage[], maxTitles = 5): Promise<string[]> {
@@ -545,12 +817,15 @@ Rules:
 }
 
 async function cmdQuery(question: string, model: string, noLlmSelect = false): Promise<void> {
+  console.log("Starting query.");
+  console.log("  - Connecting to chat client...");
   const client = getClient();
   const pages = getLivePages();
   if (pages.length === 0) {
     console.log("Wiki is empty. Run: npm start -- ingest raw/your_file.pdf");
     return;
   }
+  await testLlmConnection(client, model);
   let relevantPages: WikiPage[];
   if (noLlmSelect) {
     relevantPages = rankPagesByOverlap(question, pages, 5);
@@ -633,7 +908,6 @@ function lintPages(): Record<string, unknown> {
     stale_pages: unknown[];
     duplicate_like_titles: unknown[];
     too_few_outgoing_links: unknown[];
-    h1_filename_mismatches: unknown[];
   } = {
     total_pages: pages.length,
     missing_frontmatter: [],
@@ -644,8 +918,7 @@ function lintPages(): Record<string, unknown> {
     contradictions: [],
     stale_pages: [],
     duplicate_like_titles: [],
-    too_few_outgoing_links: [],
-    h1_filename_mismatches: []
+    too_few_outgoing_links: []
   };
   for (const page of pages) {
     let frontmatter: Frontmatter;
@@ -662,8 +935,6 @@ function lintPages(): Record<string, unknown> {
     } catch (error) {
       issues.invalid_frontmatter.push(`${page.path}: ${errorMessage(error)}`);
     }
-    const h1 = firstH1(body);
-    if (h1 && h1 !== page.title) issues.h1_filename_mismatches.push(`${page.path}: H1 '${h1}' != filename stem '${page.title}'`);
     const missingSections = validateContentSections(body, String(frontmatter.type ?? "note"));
     if (missingSections.length > 0) issues.missing_required_sections.push({ page: page.title, path: page.path, missing: missingSections });
     const links = extractWikiLinks(body);
@@ -687,7 +958,7 @@ function lintPages(): Record<string, unknown> {
 function printLintReport(report: Record<string, unknown>): void {
   console.log("=== LINT REPORT ===\n");
   console.log(`Total pages: ${String(report.total_pages)}`);
-  for (const [label, key] of [["Missing frontmatter", "missing_frontmatter"], ["Invalid frontmatter", "invalid_frontmatter"], ["H1 / filename mismatches", "h1_filename_mismatches"], ["Missing required sections", "missing_required_sections"], ["Missing links", "missing_links"], ["Orphan pages", "orphan_pages"], ["Too few outgoing links", "too_few_outgoing_links"], ["Contradiction flags", "contradictions"], ["Stale pages", "stale_pages"], ["Duplicate-like titles", "duplicate_like_titles"]]) {
+  for (const [label, key] of [["Missing frontmatter", "missing_frontmatter"], ["Invalid frontmatter", "invalid_frontmatter"], ["Missing required sections", "missing_required_sections"], ["Missing links", "missing_links"], ["Orphan pages", "orphan_pages"], ["Too few outgoing links", "too_few_outgoing_links"], ["Contradiction flags", "contradictions"], ["Stale pages", "stale_pages"], ["Duplicate-like titles", "duplicate_like_titles"]]) {
     const items = Array.isArray(report[key]) ? report[key] : [];
     console.log(`\n${label}: ${items.length}`);
     for (const item of items) console.log(`  - ${typeof item === "object" ? JSON.stringify(item) : String(item)}`);
@@ -788,7 +1059,7 @@ function errorMessage(error: unknown): string {
 
 const program = new Command();
 program.name("llm-wiki").description("LLM Wiki Engine v2");
-program.command("init").description("Create directory structure").option("--force-schema", "Overwrite schema.md with the default schema").action((options: { forceSchema?: boolean }) => cmdInit(Boolean(options.forceSchema)));
+program.command("init").description("Create directory structure").option("--force-schema", "Overwrite llmwiki_skill.md with the default skill file").action((options: { forceSchema?: boolean }) => cmdInit(Boolean(options.forceSchema)));
 program.command("ingest").description("Ingest a raw source").argument("<path>").option("--model <model>", "Model to use", DEFAULT_MODEL).option("--allow-outside-raw", "Allow ingesting a file outside raw/").option("--dry-run", "Validate model output but do not write files").action(async (sourcePath: string, options: { model: string; allowOutsideRaw?: boolean; dryRun?: boolean }) => cmdIngest(sourcePath, options.model, Boolean(options.allowOutsideRaw), Boolean(options.dryRun)));
 program.command("query").description("Query the wiki").argument("<question...>").option("--model <model>", "Model to use", DEFAULT_MODEL).option("--no-llm-select", "Use local keyword overlap instead of an LLM to select relevant pages").action(async (question: string[], options: { model: string; noLlmSelect?: boolean }) => cmdQuery(question.join(" "), options.model, Boolean(options.noLlmSelect)));
 program.command("lint").description("Audit the wiki").option("--model <model>", "Model to use", DEFAULT_MODEL).option("--deep", "Run an additional LLM audit").option("--json", "Print lint report as JSON").action(async (options: { model: string; deep?: boolean; json?: boolean }) => cmdLint(options.model, Boolean(options.deep), Boolean(options.json)));
