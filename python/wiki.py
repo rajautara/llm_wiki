@@ -8,8 +8,8 @@ Design principle:
 Environment:
     OPENAI_API_KEY                    Required for ingest/query/deep lint
     OPENAI_BASE_URL                   Optional, default: https://api.openai.com/v1
-    WIKI_MODEL                        Optional, default: gpt-4o
-    WIKI_VERIFY_SSL                   Optional, default: true. Set false/0/off/no to disable.
+    OPENAI_MODEL                      Optional, default: gpt-4o
+    OPENAI_SKIP_SSL_VERIFY            Optional, default: false. Set true/1/on/yes to disable.
     WIKI_RAW_DIR                      Optional, default: raw
     WIKI_OUTPUT_DIR                   Optional, default: wiki
     WIKI_SCHEMA_FILE                  Optional, default: llmwiki_skill.md
@@ -93,10 +93,10 @@ def env_bool(name: str, default: bool) -> bool:
 
 load_env_file()
 
-DEFAULT_MODEL = os.getenv("WIKI_MODEL", "gpt-4o")
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 API_KEY = os.getenv("OPENAI_API_KEY")
 BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-VERIFY_SSL = os.getenv("WIKI_VERIFY_SSL", "true").lower() not in {
+VERIFY_SSL = not os.getenv("OPENAI_SKIP_SSL_VERIFY", "false").lower() in {
     "false",
     "0",
     "off",

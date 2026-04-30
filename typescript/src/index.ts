@@ -33,10 +33,10 @@ type ValidatedPage = {
   content: string;
 };
 
-const DEFAULT_MODEL = process.env.WIKI_MODEL ?? "gpt-4o";
+const DEFAULT_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o";
 const API_KEY = process.env.OPENAI_API_KEY;
 const BASE_URL = process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
-const VERIFY_SSL = !["false", "0", "off", "no"].includes((process.env.WIKI_VERIFY_SSL ?? "true").toLowerCase());
+const VERIFY_SSL = !["true", "1", "on", "yes"].includes((process.env.OPENAI_SKIP_SSL_VERIFY ?? "false").toLowerCase());
 const RAW_DIR = process.env.WIKI_RAW_DIR ?? "raw";
 const WIKI_DIR = process.env.WIKI_OUTPUT_DIR ?? "wiki";
 const BACKUP_DIR = path.join(WIKI_DIR, process.env.WIKI_BACKUP_DIR_NAME ?? ".backups");
